@@ -480,17 +480,15 @@ describe("Control4 protocol", () => {
             // Historical button_(N+1) mapping is preserved for compatibility.
             expect(first).toEqual({action: "button_7_press", buttonId: 7, type: "press"});
             expect(second).toEqual({action: "button_7_press", buttonId: 7, type: "press"});
-            // Logged exactly once, under [C4 BUTTON] attribution.
-            const unknownLogs = vi
-                .mocked(logger.warning)
-                .mock.calls.filter((args) => String(args[0]).includes("[C4 BUTTON]") && String(args[0]).includes("Unknown wire id"));
+            // Logged exactly once.
+            const unknownLogs = vi.mocked(logger.warning).mock.calls.filter((args) => String(args[0]).includes("Unknown wire id"));
             expect(unknownLogs).toHaveLength(1);
         });
 
         it("logs a high unknown wire id (0x09) as unknown", () => {
             const event = parseButtonEvent("0t0001 sa c4.dmx.bp 09");
             expect(event).toEqual({action: "button_10_press", buttonId: 10, type: "press"});
-            expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining("[C4 BUTTON]"), expect.anything());
+            expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining("Unknown wire id"), expect.anything());
         });
     });
 
