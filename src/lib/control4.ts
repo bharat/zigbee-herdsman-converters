@@ -22,8 +22,19 @@
  */
 
 import {logger} from "./logger";
+import type {KeyValue, Publish, Zh} from "./types";
 
 const NS = "zhc:control4";
+
+/**
+ * The raw-send surface this module needs from zigbee-herdsman. Upstream
+ * herdsman does not expose it yet; the bharat/zigbee-herdsman control4-prod
+ * branch adds Endpoint.sendRaw with exactly this shape (also proposed
+ * upstream as a generic escape hatch for non-ZCL vendor protocols).
+ */
+interface EndpointWithSendRaw {
+    sendRaw(clusterId: number, data: Buffer, options?: {profileId?: number; timeout?: number; sendPolicy?: "immediate"}): Promise<void>;
+}
 
 // ─── Protocol Constants ──────────────────────────────────────────────
 
@@ -513,3 +524,561 @@ export const GENBASIC_ATTRS: readonly string[] = [
     "powerSource", // 0x0007
     "swBuildId", // 0x4000
 ];
+
+// ═══════════════════════════════════════════════════════════════════════
+// I/O layer (depends on zigbee-herdsman via Zh types + sendRaw)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── Core: Send C4 Text Command ─────────────────────────────────────
+//
+// The C4 text protocol sends raw ASCII as the APS payload with NO ZCL
+// framing, via Endpoint.sendRaw. Two verbs: 0s = SET (write), 0g = GET
+// (query). Both follow the same transport framing; only the verb prefix
+// differs.
+
+export async function sendC4Raw(device: Zh.Device, text: string): Promise<string> {
+    const ep = device.getEndpoint(1);
+    if (!ep) throw new Error("Endpoint 1 not found on device");
+
+    await (ep as unknown as EndpointWithSendRaw).sendRaw(C4_CLUSTER, Buffer.from(text, "ascii"), {
+        profileId: C4_MIB_PROFILE,
+        timeout: 10000,
+        sendPolicy: "immediate",
+    });
+    return text.trim();
+}
+
+export async function sendC4(device: Zh.Device, cmdBody: string): Promise<string> {
+    const seq = nextSeq();
+    return await sendC4Raw(device, formatSetCommand(seq, cmdBody));
+}
+
+export async function queryC4(device: Zh.Device, cmdBody: string): Promise<string> {
+    const seq = nextSeq();
+    return await sendC4Raw(device, formatGetCommand(seq, cmdBody));
+}
+
+// ─── Response Queue for Synchronous Query/Response ──────────────────
+//
+// The C4 text protocol is asynchronous: queries are sent to EP 1 and
+// responses arrive from EP 197. This response queue enables awaitable
+// query/response patterns used during device detection and LED reading.
+//
+// 1. queryC4WithResponse() registers a Promise resolver keyed by seq
+// 2. The query is sent to the device
+// 3. The raw fromZigbee handler receives the response and checks here
+// 4. If the seq matches, the Promise is resolved with the response text
+// 5. If the timeout expires, the Promise resolves with null
+
+const pendingQueries = new Map<string, (responseText: string) => void>();
+
+/** Resolve a pending query by response sequence. Returns true when a waiter existed. */
+export function resolveC4PendingQuery(seq: string, responseText: string): boolean {
+    const handler = pendingQueries.get(seq);
+    if (!handler) return false;
+    handler(responseText);
+    return true;
+}
+
+export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, timeoutMs = 3000): Promise<string | null> {
+    const seq = nextSeq();
+
+    return await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            pendingQueries.delete(seq);
+            logger.warning(`[C4 Q/R] Timeout for seq ${seq}: ${cmdBody}`, NS);
+            resolve(null);
+        }, timeoutMs);
+
+        pendingQueries.set(seq, (responseText) => {
+            clearTimeout(timer);
+            pendingQueries.delete(seq);
+            resolve(responseText);
+        });
+
+        sendC4Raw(device, formatGetCommand(seq, cmdBody)).catch((err) => {
+            clearTimeout(timer);
+            pendingQueries.delete(seq);
+            logger.warning(`[C4 Q/R] Send failed for seq ${seq}: ${(err as Error).message}`, NS);
+            resolve(null);
+        });
+    });
+}
+
+// ─── Device Type Detection ──────────────────────────────────────────
+//
+// A SINGLE C4 query identifies all three device types:
+//   c4.dmx.dim response:
+//     "01" → APD120 (forward-phase dimmer, 2-button rocker)
+//     "02" → KD120  (reverse-phase keypad dimmer, 6 buttons + load)
+//     error/n01 → KC120277 (configurable keypad, 6 buttons, no load)
+//
+// NOTE: probing c4.dmx.led 02 03 (button 02 existence) does NOT work: all
+// C4 devices respond to LED queries for all 6 slots, including the
+// 2-button APD120 (unused slots read 000000).
+
+export interface C4Detection {
+    deviceType: C4DeviceType;
+    dimCode: string | null;
+    confidence: string;
+}
+
+export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> {
+    logger.info(`[C4 DETECT] Probing device ${device.ieeeAddr}...`, NS);
+
+    const dimResp = await queryC4WithResponse(device, "c4.dmx.dim", 3000);
+    logger.info(`[C4 DETECT] c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
+
+    const dimCode = parseDimResponse(dimResp);
+    const deviceType = classifyDeviceType(dimResp);
+
+    // A dim answer proves the load type (confirmed). A no-answer keypad
+    // verdict is low confidence by construction: it may be a transient
+    // Zigbee timeout rather than a true keypad, so the self-heal machinery
+    // is allowed to revisit it later.
+    const confidence = dimCode ? C4_CONFIDENCE_CONFIRMED : C4_CONFIDENCE_ASSUMED;
+    logger.info(`[C4 DETECT] Device type: ${deviceType} (confidence: ${confidence})`, NS);
+    return {deviceType, dimCode, confidence};
+}
+
+// ─── Read Stored LED Colors ─────────────────────────────────────────
+//
+// C4 devices store LED colors in firmware (persisted across power cycles
+// and network migrations). This reads all stored colors for the device's
+// button set and returns them as a state update object.
+
+export async function readStoredColors(device: Zh.Device, deviceType?: string | null): Promise<KeyValue> {
+    const buttons = getButtonsForDeviceType(deviceType);
+
+    const state: KeyValue = {};
+    for (const btn of buttons) {
+        for (const [mode, suffix] of [
+            ["03", "on"],
+            ["04", "off"],
+        ]) {
+            const resp = await queryC4WithResponse(device, `c4.dmx.led ${btn.id} ${mode}`, 2000);
+            const hex = parseLedColorResponse(resp);
+            if (hex) {
+                Object.assign(state, buildLedColorState(btn.idx, suffix, hex));
+                logger.debug(`[C4 DETECT] LED ${btn.id} mode ${mode}: #${hex}`, NS);
+            } else {
+                logger.debug(`[C4 DETECT] LED ${btn.id} mode ${mode}: no response`, NS);
+            }
+        }
+    }
+    return state;
+}
+
+// ─── Debounced Load State Read (manual paddle sync) ─────────────────
+//
+// Control4 devices do NOT support ZCL attribute reporting (the load light
+// is registered with configureReporting: false), so a manual paddle press
+// at the wall never pushes a state update on its own. C4 devices DO answer
+// ZCL reads, and button presses arrive as C4 text telemetry, so every
+// button event schedules a read of the load state (genOnOff.onOff +
+// genLevelCtrl.currentLevel on EP1). The standard light() fromZigbee
+// handlers pick those read responses up and update state/brightness.
+//
+// The read is debounced per device: a dimmer paddle hold emits a burst of
+// events, so the read fires once the device has been quiet for the
+// debounce window, letting the load settle and coalescing the burst.
+
+export const C4_STATE_READ_DEBOUNCE_MS = 750;
+
+const c4StateReadTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// ─── Throttled Load State Publish (unsolicited ls telemetry) ─────────
+//
+// The primary manual-sync path: Control4 devices push their new load
+// level as c4.dmx.ls telemetry on every load change, so no ZCL read is
+// needed in the common case.
+//
+// This is a THROTTLE, not a coalesce-to-one. Each ls frame stores the
+// latest level and resets a per-device trailing-edge timer; a publish
+// happens once the device has been quiet for C4_LOAD_STATE_DEBOUNCE_MS.
+// The contract: at most one publish per 500 ms quiet window, and the
+// final settled level is ALWAYS published.
+//
+// Publishing uses the standard light() fields (state + brightness). At
+// level 0 only {state: "OFF"} is published, with NO brightness key: the
+// device resumes at its previous level via on_level, so wiping the
+// last-on brightness would only degrade the slider.
+
+export const C4_LOAD_STATE_DEBOUNCE_MS = 500;
+
+interface C4LoadStateEntry {
+    level: number;
+    timer: ReturnType<typeof setTimeout> | null;
+}
+
+const c4LoadStateTimers = new Map<string, C4LoadStateEntry>();
+
+// Per-device timestamp (ms) of the most recent ls frame seen. Used to
+// demote the ZCL read to a fallback: if ls telemetry already arrived,
+// the scheduled read is redundant and gets skipped.
+const c4LastLsSeen = new Map<string, number>();
+
+/**
+ * Schedule a trailing-edge debounced publish of load state for a device.
+ * Each ls frame stores the latest level and resets the per-device timer;
+ * once the device goes quiet for C4_LOAD_STATE_DEBOUNCE_MS, the latest
+ * level for that window is published. Also records the ls-seen timestamp
+ * so scheduleC4StateRead can skip its fallback read.
+ */
+export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level: number, publish: Publish): void {
+    if (!device) return;
+
+    const key = device.ieeeAddr;
+    c4LastLsSeen.set(key, Date.now());
+
+    const existing = c4LoadStateTimers.get(key);
+    if (existing?.timer) clearTimeout(existing.timer);
+
+    const entry: C4LoadStateEntry = {level, timer: null};
+    entry.timer = setTimeout(() => {
+        c4LoadStateTimers.delete(key);
+        const lvl = entry.level;
+        publish(lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"});
+    }, C4_LOAD_STATE_DEBOUNCE_MS);
+
+    c4LoadStateTimers.set(key, entry);
+}
+
+/**
+ * Schedule a debounced read of the load on/off + level state for a device.
+ * Each call resets the per-device timer; the read fires once the device
+ * has been quiet for C4_STATE_READ_DEBOUNCE_MS. Pure keypads have no load,
+ * so they are skipped. Read failures are logged and swallowed.
+ *
+ * This is a FALLBACK behind the ls-telemetry path: if an ls frame arrived
+ * after the read was scheduled, the debounced load-state publish already
+ * refreshed the state, so the read is skipped.
+ */
+export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: string | null): void {
+    if (!device) return;
+
+    // Pure keypads drive no load, so there is nothing to read. When the
+    // device type is unknown the read is attempted anyway (guarded below).
+    if (deviceType === "keypad") return;
+
+    const key = device.ieeeAddr;
+    const scheduledAt = Date.now();
+    const existing = c4StateReadTimers.get(key);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(async () => {
+        c4StateReadTimers.delete(key);
+
+        // Fallback demotion: if an ls frame arrived after this read was
+        // scheduled, the debounced load-state publish already updated state.
+        const lastLs = c4LastLsSeen.get(key);
+        if (lastLs !== undefined && lastLs > scheduledAt) {
+            logger.debug(`[C4 STATE] Skipping ZCL read for ${key}; ls telemetry already refreshed state`, NS);
+            return;
+        }
+
+        let ep1: Zh.Endpoint | undefined;
+        try {
+            ep1 = device.getEndpoint(1);
+        } catch (err) {
+            logger.debug(`[C4 STATE] getEndpoint(1) failed: ${(err as Error).message}`, NS);
+            return;
+        }
+        if (!ep1) return;
+
+        try {
+            await ep1.read("genOnOff", ["onOff"]);
+        } catch (err) {
+            logger.debug(`[C4 STATE] genOnOff read failed: ${(err as Error).message}`, NS);
+        }
+        try {
+            await ep1.read("genLevelCtrl", ["currentLevel"]);
+        } catch (err) {
+            logger.debug(`[C4 STATE] genLevelCtrl read failed: ${(err as Error).message}`, NS);
+        }
+    }, C4_STATE_READ_DEBOUNCE_MS);
+
+    c4StateReadTimers.set(key, timer);
+}
+
+// ─── Self-Heal: Reclassification + Active Probe Campaign ─────────────
+//
+// Two mechanisms correct a device mis-classified as keypad by a silent
+// dim-probe timeout, without ever requiring a manual c4_detect:
+//
+//   PASSIVE: any load evidence that arrives on its own (an ls broadcast or
+//   a c4.dmx.dim answer) proves the device drives a load, so it is
+//   reclassified immediately via applyC4Heal.
+//
+//   ACTIVE: for a keypad that is still only "assumed", the dim probe is
+//   re-run a few times (jittered start, exponential backoff) until either
+//   it answers (heal) or it stays silent C4_MAX_SILENT_PROBES times in a
+//   row (upgrade to a confirmed keypad and stop). Confirmed keypads are
+//   never probed again, and the confirmed marker is persisted so a restart
+//   does not restart the campaign from zero.
+
+/** Jitter window for the first probe, spreading radio traffic so a fleet does not all probe at once on startup. */
+export const C4_PROBE_INITIAL_MAX_MS = 60000;
+
+/** Base gap between silent probes; doubled after each additional silence. */
+export const C4_PROBE_BACKOFF_MS = 30000;
+
+interface C4ProbeCampaign {
+    silentCount: number;
+    timer: ReturnType<typeof setTimeout> | null;
+}
+
+const c4ProbeCampaigns = new Map<string, C4ProbeCampaign>();
+
+interface C4MetaFields {
+    type?: string;
+    confidence?: string;
+    dimCode?: string | null;
+    silentProbes?: number;
+}
+
+/** Persist self-heal fields onto device.meta and flush via device.save(). */
+function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
+    if (fields.type !== undefined) device.meta.c4_device_type = fields.type;
+    if (fields.confidence !== undefined) device.meta.c4_type_confidence = fields.confidence;
+    if (fields.dimCode !== undefined) device.meta.c4_dim_code = fields.dimCode;
+    if (fields.silentProbes !== undefined) device.meta.c4_silent_probes = fields.silentProbes;
+    if (typeof device.save === "function") device.save();
+}
+
+/** Tear down any in-flight probe campaign for a device. */
+function stopC4ProbeCampaign(device: Zh.Device): void {
+    const campaign = c4ProbeCampaigns.get(device.ieeeAddr);
+    if (campaign?.timer) clearTimeout(campaign.timer);
+    c4ProbeCampaigns.delete(device.ieeeAddr);
+}
+
+/** Reset all in-memory self-heal campaign state (for testing). */
+export function resetC4HealState(): void {
+    for (const campaign of c4ProbeCampaigns.values()) {
+        if (campaign.timer) clearTimeout(campaign.timer);
+    }
+    c4ProbeCampaigns.clear();
+}
+
+/**
+ * Reclassify a device from load evidence and persist the correction.
+ * Returns the state fragment to publish (containing the frozen-contract
+ * c4_device_type plus an extended c4_detect_result), or null when no
+ * correction is warranted. Idempotent: once a device is confirmed at the
+ * target type, repeat evidence is a no-op so the probe path and the
+ * response path can both observe the same answer without double
+ * publishing.
+ */
+export function applyC4Heal(
+    device: Zh.Device | undefined,
+    currentType: string | undefined | null,
+    evidence: C4HealEvidence,
+    publish?: Publish,
+): KeyValue | null {
+    if (!device) return null;
+
+    const newType = healTypeFromEvidence(currentType, evidence);
+    if (!newType) return null;
+
+    const already = device.meta.c4_device_type === newType && device.meta.c4_type_confidence === C4_CONFIDENCE_CONFIRMED;
+    if (already) return null;
+
+    const dimCode = evidence.dimCode != null ? evidence.dimCode : ((device.meta.c4_dim_code as string | null) ?? null);
+    let evidenceDesc: string;
+    if (evidence.dimCode != null) {
+        evidenceDesc = `c4.dmx.dim answer ${evidence.dimCode}`;
+    } else if (evidence.paddle) {
+        evidenceDesc = "c4.dmx.bp local load paddle telemetry";
+    } else {
+        evidenceDesc = "c4.dmx.ls load telemetry";
+    }
+
+    logger.info(`[C4 HEAL] ${device.ieeeAddr}: ${currentType ?? "(none)"} -> ${newType} (evidence: ${evidenceDesc})`, NS);
+
+    // Reclassification changes c4_device_type at runtime, mirroring the
+    // c4_detect flow exactly: update device.meta + device.save() and publish
+    // the new c4_device_type.
+    persistC4Meta(device, {type: newType, confidence: C4_CONFIDENCE_CONFIRMED, dimCode});
+
+    // Load is proven, so any active probe campaign is done.
+    stopC4ProbeCampaign(device);
+
+    const state: KeyValue = {
+        c4_device_type: newType,
+        c4_detect_result: {
+            ieee_address: device.ieeeAddr,
+            device_type: newType,
+            confidence: C4_CONFIDENCE_CONFIRMED,
+            dim_code: dimCode,
+            model: MODEL_NAMES[newType] ?? "unknown",
+            description: MODEL_DESCRIPTIONS[newType] ?? "Unknown Control4 device",
+            healed: true,
+            evidence: evidenceDesc,
+        },
+    };
+
+    if (publish) publish(state);
+    return state;
+}
+
+/**
+ * Upgrade an assumed keypad to a confirmed keypad. Called both after
+ * enough silence and immediately on an explicit negative dim answer; the
+ * evidence/logReason override lets each path record its own proof.
+ */
+function markConfirmedC4Keypad(device: Zh.Device, publish?: Publish, opts: {evidence?: string; logReason?: string} = {}): void {
+    const evidence = opts.evidence ?? `${C4_MAX_SILENT_PROBES} consecutive silent c4.dmx.dim probes`;
+    const logReason = opts.logReason ?? `keypad confirmed after ${C4_MAX_SILENT_PROBES} silent c4.dmx.dim probes`;
+
+    persistC4Meta(device, {confidence: C4_CONFIDENCE_CONFIRMED});
+    logger.info(`[C4 HEAL] ${device.ieeeAddr}: ${logReason}`, NS);
+
+    if (publish) {
+        publish({
+            c4_detect_result: {
+                ieee_address: device.ieeeAddr,
+                device_type: "keypad",
+                confidence: C4_CONFIDENCE_CONFIRMED,
+                dim_code: null,
+                model: MODEL_NAMES.keypad,
+                description: MODEL_DESCRIPTIONS.keypad,
+                healed: false,
+                evidence,
+            },
+        });
+    }
+}
+
+/**
+ * Normalize a probeFn return value into a {kind, dimCode?} outcome. The
+ * default probeFn returns a classifyDimProbeResponse object, but the
+ * legacy test seam contract is a bare dim code string (heal) or null
+ * (silent), so both shapes are accepted.
+ */
+function normalizeProbeOutcome(result: C4DimProbeOutcome | string | null | undefined): C4DimProbeOutcome {
+    if (result == null) return {kind: "silent"};
+    if (typeof result === "object") return result;
+    return {kind: "heal", dimCode: result};
+}
+
+export interface C4ProbeCampaignOpts {
+    probeFn?: (device: Zh.Device) => Promise<C4DimProbeOutcome | string | null>;
+    random?: () => number;
+    initialMaxMs?: number;
+    backoffMs?: number;
+    publish?: Publish;
+}
+
+/**
+ * Start (once per process) an active dim-probe campaign for an assumed
+ * keypad. No-op for non-keypads and for already-confirmed keypads. The
+ * first probe is jittered across C4_PROBE_INITIAL_MAX_MS; subsequent
+ * silent probes back off exponentially. A dim answer heals via the
+ * response path; C4_MAX_SILENT_PROBES silences confirm the keypad and
+ * stop the campaign.
+ */
+export function scheduleC4ProbeCampaign(
+    device: Zh.Device | undefined,
+    deviceType: string | undefined | null,
+    publish?: Publish,
+    opts: C4ProbeCampaignOpts = {},
+): void {
+    if (!device) return;
+    if (deviceType !== "keypad") return; // never probe a load-bearing device
+    if (effectiveConfidence(device.meta) === C4_CONFIDENCE_CONFIRMED) return; // never re-probe a confirmed keypad
+    if (c4ProbeCampaigns.has(device.ieeeAddr)) return; // one campaign per process lifetime
+
+    const probeFn = opts.probeFn ?? (async (dev: Zh.Device) => classifyDimProbeResponse(await queryC4WithResponse(dev, "c4.dmx.dim", 3000)));
+    const random = opts.random ?? Math.random;
+    const initialMaxMs = opts.initialMaxMs ?? C4_PROBE_INITIAL_MAX_MS;
+    const backoffMs = opts.backoffMs ?? C4_PROBE_BACKOFF_MS;
+
+    const campaign: C4ProbeCampaign = {silentCount: (device.meta.c4_silent_probes as number | undefined) ?? 0, timer: null};
+    c4ProbeCampaigns.set(device.ieeeAddr, campaign);
+
+    const runProbe = async (): Promise<void> => {
+        campaign.timer = null;
+
+        let outcome: C4DimProbeOutcome;
+        try {
+            outcome = normalizeProbeOutcome(await probeFn(device));
+        } catch (err) {
+            logger.warning(`[C4 HEAL] Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
+            outcome = {kind: "silent"};
+        }
+
+        if (outcome.kind === "heal") {
+            // The dim response also flows through the raw fromZigbee handler,
+            // which heals and publishes; applyC4Heal here is idempotent
+            // (no-op if already healed) so the injected-probe path still heals.
+            applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
+            c4ProbeCampaigns.delete(device.ieeeAddr);
+            return;
+        }
+
+        if (outcome.kind === "negative") {
+            // A true keypad answers the dim probe with an explicit no-load
+            // response rather than timing out. That is proof, not silence, so
+            // confirm immediately instead of burning the silent-probe budget
+            // and its exponential backoff.
+            markConfirmedC4Keypad(device, publish, {
+                logReason: "keypad confirmed by explicit n01 answer",
+                evidence: "explicit n01 answer",
+            });
+            c4ProbeCampaigns.delete(device.ieeeAddr);
+            return;
+        }
+
+        campaign.silentCount += 1;
+        persistC4Meta(device, {silentProbes: campaign.silentCount});
+
+        if (campaign.silentCount >= C4_MAX_SILENT_PROBES) {
+            markConfirmedC4Keypad(device, publish);
+            c4ProbeCampaigns.delete(device.ieeeAddr);
+            return;
+        }
+
+        campaign.timer = setTimeout(runProbe, backoffMs * 2 ** (campaign.silentCount - 1));
+    };
+
+    campaign.timer = setTimeout(runProbe, Math.floor(random() * initialMaxMs));
+}
+
+// ─── Startup Arming of the Probe Campaign ───────────────────────────
+//
+// scheduleC4ProbeCampaign was originally only kicked off from the raw
+// fromZigbee handler, so a device had to emit C4 text traffic before its
+// campaign armed. Quiet keypads never did, so in production 6 of 8
+// devices sat unprobed. Every assumed-keypad device is now armed at
+// startup via the definition's onEvent "start" hook. A device whose
+// stored classification is a load type (dimmer / keypaddim) or a
+// confirmed keypad is skipped by scheduleC4ProbeCampaign; an absent
+// classification is treated as an assumed keypad so a never-detected
+// device still gets probed. The per-device jitter inside the campaign
+// keeps a fleet from probing at once, and the fz-side arming stays as an
+// idempotent supplement.
+
+/**
+ * Arm the self-heal probe campaign for assumed-keypad (or unclassified)
+ * devices when the bridge starts. Called from the definition's onEvent
+ * handler with the event's device and state; the opts parameter is a test
+ * seam forwarded to scheduleC4ProbeCampaign.
+ */
+export function c4ArmProbeOnStart(device: Zh.Device | undefined, state: KeyValue | undefined, opts: C4ProbeCampaignOpts = {}): void {
+    if (!device) return;
+
+    const currentType = (state?.c4_device_type as string | undefined) ?? (device.meta.c4_device_type as string | undefined) ?? "keypad";
+    scheduleC4ProbeCampaign(device, currentType, opts.publish, opts);
+}
+
+/**
+ * Short device identity for log attribution: the ieeeAddr, plus the
+ * friendly name when the device object carries one cheaply.
+ */
+export function c4DeviceLabel(device: Zh.Device | undefined): string {
+    if (!device) return "?";
+    const ieee = device.ieeeAddr ?? "?";
+    const name = (device.meta.friendlyName as string | undefined) ?? undefined;
+    return name ? `${ieee} (${name})` : ieee;
+}
