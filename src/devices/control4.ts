@@ -7,38 +7,19 @@ import type {DefinitionWithExtend, Fz, KeyValue, Tz, Zh} from "../lib/types";
 const e = exposes.presets;
 const NS = "zhc:control4";
 
-/**
- * Read arbitrary cluster attributes for the diagnostic converters. The typed
- * Endpoint.read API is keyed to known cluster attribute names; these
- * converters exist precisely to poke at anything, so the call goes through a
- * loosened signature.
- */
+// Read arbitrary cluster attributes through a loosened Endpoint.read signature
+// (the typed API is keyed to known attribute names; the diagnostic converters
+// exist precisely to poke at anything).
 async function readLoose(ep: Zh.Endpoint, cluster: string | number, attrs: (string | number)[]): Promise<KeyValue> {
     const read = ep.read as unknown as (c: string | number, a: (string | number)[], o?: {timeout?: number}) => Promise<KeyValue | undefined>;
     return (await read.call(ep, cluster, attrs, {timeout: 10000})) ?? {};
 }
 
-// Control4 in-wall Zigbee devices: C4-APD120 (dimmer, 2 buttons + load),
-// C4-KD120 (keypad dimmer, 6 buttons + load), C4-KC120277 (configurable
-// keypad, 6 buttons, no load). All share identical endpoint structures and
-// the proprietary c4.dmx text protocol on custom profile 0xC25C; device
-// type differentiation happens at runtime via protocol probing. Standard
-// on/off + dimming rides genOnOff/genLevelCtrl on endpoint 1.
-//
-// Requires an adapter stack that accepts profile 0xC25C (the whitelist in
-// zigbee-herdsman) and Endpoint.sendRaw for outbound text commands.
-
-// ─── fromZigbee: Capture C4 Text Protocol Responses ─────────────────
-//
-// C4 devices send responses and telemetry as raw ASCII from endpoint 197
-// (0xC5), profile 0xC25C, cluster 1. With no ZCL framing, herdsman fires
-// a "raw" event captured here. Cluster ID 1 resolves to genPowerCfg.
-//
-// Response format: "0r<seq> 000 [data]" (success) or "0r<seq> v01" (error)
-// Telemetry format: "0t<seq> sa <command> <data>"
-
+// C4 responses and telemetry arrive as raw ASCII from endpoint 197, profile
+// 0xC25C, cluster 1 (which ZCL resolves to genPowerCfg), so herdsman fires a
+// "raw" event captured here.
 const fzControl4Response = {
-    cluster: "genPowerCfg", // C4 uses cluster ID 1, which ZCL maps to genPowerCfg
+    cluster: "genPowerCfg",
     type: ["raw"],
     convert: async (model, msg, publish, options, meta) => {
         let text: string;
@@ -50,43 +31,35 @@ const fzControl4Response = {
         if (!text) return;
 
         const epId = msg.endpoint?.ID ?? "?";
-        logger.debug(`[C4 RECV] EP ${epId}: ${text}`, NS);
+        logger.debug(`Received EP ${epId}: ${text}`, NS);
 
-        // ── Check for pending query responses (response queue) ──
         const respSeq = c4.parseResponseSeq(text);
         if (respSeq && c4.resolveC4PendingQuery(respSeq, text)) {
-            logger.debug(`[C4 Q/R] Resolved pending query seq ${respSeq}`, NS);
+            logger.debug(`Resolved pending query seq ${respSeq}`, NS);
         }
 
         const result: KeyValue = {c4_response: text, c4_response_ep: epId};
 
         const currentType = (meta.state?.c4_device_type as string | undefined) ?? (msg.device?.meta.c4_device_type as string | undefined);
 
-        // Kick off the active self-heal campaign for an assumed keypad on
-        // the first message seen from this device (idempotent thereafter).
-        // No-op for load-bearing devices and confirmed keypads.
+        // Arm the self-heal campaign on the first message from an assumed
+        // keypad (idempotent; no-op for load types and confirmed keypads).
         c4.scheduleC4ProbeCampaign(msg.device, currentType, publish);
 
-        // ── Passive self-heal: a c4.dmx.dim answer proves a load ──
-        //
-        // Any dim answer (solicited by a probe or otherwise) is
-        // authoritative load evidence, so reclassify keypad/none immediately.
+        // Passive self-heal: any dim answer is authoritative load evidence.
         const dimAnswerCode = c4.parseDimResponse(text);
         if (dimAnswerCode) {
             const healState = c4.applyC4Heal(msg.device, currentType, {dimCode: dimAnswerCode});
             if (healState) Object.assign(result, healState);
         }
 
-        // ── Parse button/event messages ──
         const event = c4.parseButtonEvent(text);
         if (event) {
             result.action = event.action;
-            logger.debug(`[C4 BUTTON] ${c4.c4DeviceLabel(msg.device)} ${event.type}: ${event.action}`, NS);
+            logger.debug(`${c4.c4DeviceLabel(msg.device)} ${event.type}: ${event.action}`, NS);
 
-            // Passive self-heal: a local load paddle half only exists on
-            // load-bearing hardware, so a paddle event proves the device
-            // drives a load. Upgrades an assumed keypad / unclassified
-            // device to keypaddim (never downgrades an existing load type).
+            // Passive self-heal: a load paddle half only exists on
+            // load-bearing hardware.
             if (event.paddle) {
                 const healState = c4.applyC4Heal(msg.device, currentType, {paddle: true});
                 if (healState) Object.assign(result, healState);
@@ -103,44 +76,34 @@ const fzControl4Response = {
                             const cmd =
                                 behavior === "toggle_load" ? "toggle" : behavior === "load_on" ? "on" : behavior === "load_off" ? "off" : null;
                             if (cmd) {
-                                logger.debug(`[C4 BUTTON] ${c4.c4DeviceLabel(msg.device)} Smart behavior: genOnOff.${cmd}`, NS);
+                                logger.debug(`${c4.c4DeviceLabel(msg.device)} Smart behavior: genOnOff.${cmd}`, NS);
                                 await ep1.command("genOnOff", cmd, {});
                             }
                         }
                     } catch (err) {
-                        logger.warning(`[C4 BUTTON] ${c4.c4DeviceLabel(msg.device)} Smart behavior failed: ${(err as Error).message}`, NS);
+                        logger.warning(`${c4.c4DeviceLabel(msg.device)} Smart behavior failed: ${(err as Error).message}`, NS);
                     }
                 }
             }
 
-            // Sync load state after any button event. Manual paddle presses
-            // never report their state (no ZCL reporting), and the
-            // smart-behavior genOnOff command above also does not update
-            // state on its own, so this debounced read covers both paths.
+            // Manual paddle presses and the smart-behavior command above never
+            // report state on their own, so schedule a debounced load read.
             c4.scheduleC4StateRead(msg.device, meta.state?.c4_device_type as string | undefined);
 
             return result;
         }
 
-        // ── Parse unsolicited load-status telemetry ──
-        //
-        // Devices push their new load level on every change. Coalesce the
-        // dim-ramp burst and publish the settled state/brightness.
         const loadStatus = c4.parseLoadStatus(text);
         if (loadStatus) {
-            logger.debug(`[C4 LS] ${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
+            logger.debug(`${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
 
-            // Passive self-heal: unsolicited ls telemetry proves the device
-            // drives a load, so an assumed keypad becomes keypaddim.
+            // Passive self-heal: ls telemetry proves the device drives a load.
             const healState = c4.applyC4Heal(msg.device, currentType, {ls: true});
             if (healState) Object.assign(result, healState);
 
-            // Mute the raw c4_response for unsolicited ls telemetry: the
-            // debounced scheduleC4LoadStatePublish below already carries the
-            // level, so echoing c4_response here would double MQTT volume
-            // during a ramp. Query responses (the 0r<seq> form) are NOT ls
-            // telemetry and keep publishing c4_response via the fall-through
-            // return below; only this telemetry case is muted.
+            // Mute the raw c4_response for ls telemetry: the debounced publish
+            // below carries the level, and echoing both would double MQTT
+            // volume during a dim ramp.
             delete result.c4_response;
             delete result.c4_response_ep;
 
@@ -152,15 +115,8 @@ const fzControl4Response = {
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["raw"]>;
 
-// ─── toZigbee: Set LED Colors ────────────────────────────────────────
-//
-// Single LED:
-//   {"c4_led": {"led": "1", "color": "ff0000"}}
-//   {"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}}
-// All 4 dimmer LEDs at once:
-//   {"c4_led": {"top_on": "ffffff", "top_off": "000000",
-//               "bottom_on": "000000", "bottom_off": "0000ff"}}
-
+// Set LED colors, single ({"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}})
+// or batch ({"c4_led": {"top_on": "ffffff", "bottom_off": "0000ff", ...}}).
 const tzControl4Led = {
     key: ["c4_led"],
     convertSet: async (entity, key, value, meta) => {
@@ -168,7 +124,6 @@ const tzControl4Led = {
         const val = value as KeyValue;
         const state: KeyValue = {};
 
-        // Batch mode: set all 4 dimmer LED states at once
         if (val.top_on !== undefined || val.top_off !== undefined || val.bottom_on !== undefined || val.bottom_off !== undefined) {
             const commands: [string, string, unknown][] = [
                 ["01", "03", val.top_on],
@@ -194,7 +149,6 @@ const tzControl4Led = {
             return {state};
         }
 
-        // Single LED mode
         const led = (val.led as string | undefined) ?? "top";
         const color = val.color as string | undefined;
         const mode = (val.mode as string | undefined) ?? "on";
@@ -219,11 +173,7 @@ const tzControl4Led = {
     },
 } satisfies Tz.Converter;
 
-// ─── toZigbee: Raw C4 Text Command ──────────────────────────────────
-//
-// For experimentation. The "0s<seq> " prefix and "\r\n" suffix are
-// auto-added: {"c4_cmd": "c4.dmx.led 01 03 ff0000"}
-
+// Raw C4 text command; the "0s<seq> " prefix and "\r\n" suffix are auto-added.
 const tzControl4Cmd = {
     key: ["c4_cmd"],
     convertSet: async (entity, key, value, meta) => {
@@ -237,12 +187,8 @@ const tzControl4Cmd = {
     },
 } satisfies Tz.Converter;
 
-// ─── toZigbee: C4 GET Query ──────────────────────────────────────────
-//
-// Like c4_cmd but uses the "0g" (GET) prefix. Responses arrive
-// asynchronously from endpoint 197 and are captured by fzControl4Response
-// (published as c4_response in device state): {"c4_query": "c4.dmx.amb 01"}
-
+// Like c4_cmd but with the "0g" (GET) prefix; the response arrives
+// asynchronously from EP 197 and is published as c4_response.
 const tzControl4Query = {
     key: ["c4_query"],
     convertSet: async (entity, key, value, meta) => {
@@ -252,18 +198,13 @@ const tzControl4Query = {
         }
 
         const sent = await c4.queryC4(meta.device, value);
-        logger.debug(`[C4 QUERY] sent: ${sent}`, NS);
+        logger.debug(`Query sent: ${sent}`, NS);
         return {state: {c4_last_query: sent}};
     },
 } satisfies Tz.Converter;
 
-// ─── toZigbee: Read ZCL Attributes ──────────────────────────────────
-//
-// Read arbitrary cluster attributes for device interrogation. Results are
-// returned in device state as probe_result:
-//   {"zcl_read": {"cluster": "genBasic"}}
-//   {"zcl_read": {"cluster": 0, "attributes": [0,1,2]}}
-
+// Read arbitrary ZCL attributes for device interrogation; results are
+// published as probe_result.
 const tzControl4ZclRead = {
     key: ["zcl_read"],
     convertSet: async (entity, key, value, meta) => {
@@ -284,14 +225,14 @@ const tzControl4ZclRead = {
             throw new Error('zcl_read requires "attributes" array (or use cluster "genBasic" for defaults)');
         }
 
-        logger.info(`[C4 PROBE] Reading EP ${epId} cluster ${cluster}: ${JSON.stringify(attributes)}`, NS);
+        logger.info(`Reading EP ${epId} cluster ${cluster}: ${JSON.stringify(attributes)}`, NS);
 
         try {
             const result = await readLoose(ep, cluster, attributes);
-            logger.info(`[C4 PROBE] Result: ${JSON.stringify(result)}`, NS);
+            logger.info(`Result: ${JSON.stringify(result)}`, NS);
             return {state: {probe_result: {cluster: String(cluster), endpoint: epId, attributes: result}}};
         } catch (batchErr) {
-            logger.info(`[C4 PROBE] Batch read failed (${(batchErr as Error).message}), trying one-by-one...`, NS);
+            logger.info(`Batch read failed (${(batchErr as Error).message}), trying one-by-one...`, NS);
             const result: KeyValue = {};
             for (const attr of attributes) {
                 try {
@@ -305,12 +246,8 @@ const tzControl4ZclRead = {
     },
 } satisfies Tz.Converter;
 
-// ─── toZigbee: Comprehensive Device Probe ───────────────────────────
-//
-// Dumps everything knowable about the device in one shot: all endpoints
-// with profile/deviceID/cluster lists, plus genBasic attributes from
-// endpoint 1. {"c4_probe": true}
-
+// Dump all endpoints (profile/deviceID/cluster lists) plus genBasic
+// attributes from endpoint 1 in one shot.
 const tzControl4Probe = {
     key: ["c4_probe"],
     convertSet: async (entity, key, value, meta) => {
@@ -349,44 +286,32 @@ const tzControl4Probe = {
                 }
             }
             result.genBasic = genBasic;
-            logger.info(`[C4 PROBE] genBasic: ${JSON.stringify(genBasic)}`, NS);
+            logger.info(`genBasic: ${JSON.stringify(genBasic)}`, NS);
         }
 
-        logger.info(`[C4 PROBE] Full result: ${JSON.stringify(result)}`, NS);
+        logger.info(`Full probe result: ${JSON.stringify(result)}`, NS);
         return {state: {probe_result: result}};
     },
 } satisfies Tz.Converter;
 
-// ─── toZigbee: Device Type Detection + LED Color Reading ─────────────
-//
-// Runtime detection: probes the device to determine type (dimmer,
-// keypaddim, or keypad), then reads all stored LED colors from firmware
-// and populates state. Run once after pairing: {"c4_detect": true}
-// Migrated devices show their existing C4 colors without manual
-// reconfiguration.
-
+// Runtime detection: probe the device type, then read all firmware-stored
+// LED colors into state. Run once after pairing: {"c4_detect": true}.
 const tzControl4Detect = {
     key: ["c4_detect"],
     convertSet: async (entity, key, value, meta) => {
         const device = meta.device;
         if (!device) throw new Error("c4_detect requires a device");
 
-        // Step 1: Detect device type
         const {deviceType, dimCode, confidence} = await c4.detectDeviceType(device);
-
-        // Step 2: Read stored LED colors from firmware
         const colorState = await c4.readStoredColors(device, deviceType);
 
-        // Step 3: Build the full state update
         const state: KeyValue = {
             c4_device_type: deviceType,
             ...colorState,
         };
 
-        // Step 4: Store device type + confidence in device.meta for the
-        // self-heal machinery. A manual c4_detect that times out yields an
-        // assumed keypad, which the active probe campaign may later confirm
-        // or heal.
+        // A detect that times out yields an assumed keypad, which the active
+        // probe campaign may later confirm or heal.
         device.meta.c4_device_type = deviceType;
         device.meta.c4_type_confidence = confidence;
         device.meta.c4_dim_code = dimCode ?? null;
@@ -402,21 +327,10 @@ const tzControl4Detect = {
             colors_read: Object.keys(colorState).length,
         };
 
-        logger.info(`[C4 DETECT] Complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
+        logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
         return {state};
     },
 } satisfies Tz.Converter;
-
-// ─── Definition ──────────────────────────────────────────────────────
-//
-// Entity layout per device:
-//   - 1 main dimmer light (standard Zigbee HA, harmless on pure keypads)
-//   - 1 action entity (button/paddle press events)
-//   - Utility converters: c4_led, c4_cmd, c4_query, zcl_read, c4_probe,
-//     c4_detect
-//
-// LED colors are stored as flat hex attributes (c4_led_N_on/off) in
-// device state, readable by downstream integrations on startup.
 
 export const definitions: DefinitionWithExtend[] = [
     {
@@ -440,8 +354,7 @@ export const definitions: DefinitionWithExtend[] = [
         toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect],
         meta: {disableDefaultResponse: true},
         // Arm the self-heal probe campaign for quiet assumed-keypads at
-        // startup. The light() extend adds no onEvent, so a definition-level
-        // handler composes cleanly.
+        // startup (the light() extend adds no onEvent).
         onEvent: (event) => {
             if (event.type !== "start") return;
             c4.c4ArmProbeOnStart(event.data.device, event.data.state);
@@ -450,35 +363,28 @@ export const definitions: DefinitionWithExtend[] = [
             const endpoint = device.getEndpoint(1);
             if (!endpoint) return;
 
-            // Bind standard HA clusters on EP 1. NOTE: no coordinator
-            // endpoint registration is needed for the C4 text protocol;
-            // reception is gated by the profile whitelist alone and the NCP
-            // delivers EP 197 frames without any endpoint registration.
+            // No coordinator endpoint registration is needed for the C4 text
+            // protocol; reception is gated by the profile whitelist alone.
             try {
                 await endpoint.bind("genOnOff", coordinatorEndpoint);
                 await endpoint.bind("genLevelCtrl", coordinatorEndpoint);
             } catch (err) {
-                logger.info(`[C4 CONFIG] Cluster binding failed (may be normal for keypads): ${(err as Error).message}`, NS);
+                logger.info(`Cluster binding failed (may be normal for keypads): ${(err as Error).message}`, NS);
             }
 
-            // Auto-detect device type via the C4 text protocol. c4_detect
-            // can always be run manually later if this times out.
             try {
                 const {deviceType, dimCode, confidence} = await c4.detectDeviceType(device);
                 device.meta.c4_device_type = deviceType;
                 device.meta.c4_type_confidence = confidence;
                 device.meta.c4_dim_code = dimCode ?? null;
                 device.save();
-                logger.info(
-                    `[C4 CONFIG] Auto-detected device type: ${deviceType} (${c4.MODEL_NAMES[deviceType] ?? "unknown"}, confidence: ${confidence})`,
-                    NS,
-                );
+                logger.info(`Auto-detected device type: ${deviceType} (${c4.MODEL_NAMES[deviceType] ?? "unknown"}, confidence: ${confidence})`, NS);
             } catch (err) {
-                logger.warning(`[C4 CONFIG] Auto-detection failed: ${(err as Error).message}`, NS);
-                logger.warning(`[C4 CONFIG] Run {"c4_detect": true} to detect device type and read LED colors.`, NS);
+                logger.warning(`Auto-detection failed: ${(err as Error).message}`, NS);
+                logger.warning(`Run {"c4_detect": true} to detect device type and read LED colors.`, NS);
             }
 
-            logger.info(`[C4 CONFIG] Device ${device.ieeeAddr} configured.`, NS);
+            logger.info(`Device ${device.ieeeAddr} configured.`, NS);
         },
     },
 ];

@@ -30,6 +30,7 @@ import {logger} from "../src/lib/logger";
 import type {KeyValue, Zh} from "../src/lib/types";
 
 interface MockEndpoint {
+    // biome-ignore lint/style/useNamingConvention: mirrors the Zh.Endpoint field name
     ID: number;
     read: ReturnType<typeof vi.fn>;
     command: ReturnType<typeof vi.fn>;
@@ -177,7 +178,7 @@ describe("Control4 glue", () => {
             expect(device.meta.c4_type_confidence).toBe(C4_CONFIDENCE_CONFIRMED);
             expect(device.save).toHaveBeenCalled();
             expect(publish).toHaveBeenCalledWith(expect.objectContaining({c4_device_type: "keypaddim"}));
-            expect((state?.c4_detect_result as KeyValue).healed).toBe(true);
+            expect((state?.c4_detect_result as KeyValue | undefined)?.healed).toBe(true);
         });
 
         it("heals an assumed keypad to dimmer on a dim answer of 01", () => {
@@ -231,7 +232,7 @@ describe("Control4 glue", () => {
             expect(state?.c4_device_type).toBe("keypaddim");
             expect(device.meta.c4_device_type).toBe("keypaddim");
             expect(device.meta.c4_type_confidence).toBe(C4_CONFIDENCE_CONFIRMED);
-            expect((state?.c4_detect_result as KeyValue).evidence).toContain("paddle");
+            expect((state?.c4_detect_result as KeyValue | undefined)?.evidence).toContain("paddle");
             expect(publish).toHaveBeenCalledWith(expect.objectContaining({c4_device_type: "keypaddim"}));
         });
 
@@ -633,9 +634,7 @@ describe("Control4 glue", () => {
                 "0x0005",
                 {},
                 {
-                    readImpl: async () => {
-                        throw new Error("device unreachable");
-                    },
+                    readImpl: () => Promise.reject(new Error("device unreachable")),
                 },
             );
 
@@ -693,7 +692,7 @@ describe("Control4 glue", () => {
         // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
         type AnyFn = (...args: any[]) => any;
         const definition = definitions[0];
-        const fzConvert = (definition.fromZigbee?.[0] as {convert: AnyFn}).convert;
+        const fzConvert = (definition.fromZigbee as unknown as [{convert: AnyFn}])[0].convert;
 
         function convert(text: string, device: MockDevice, state: KeyValue = {}): Promise<KeyValue | undefined> {
             const msg = {

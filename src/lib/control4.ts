@@ -1,24 +1,17 @@
 /**
- * Control4 Zigbee device support: the `c4.dmx.*` text protocol.
+ * Control4 in-wall Zigbee devices (C4-APD120 dimmer, C4-KD120 keypad dimmer,
+ * C4-KC120277 configurable keypad) carry LED control, button events and
+ * device identification over a proprietary ASCII protocol on custom Zigbee
+ * profile 0xC25C ("MIB"):
  *
- * All newer C4 in-wall devices (C4-APD120 dimmer, C4-KD120 keypad dimmer,
- * C4-KC120277 configurable keypad) share identical endpoint structures and
- * carry LED control, button events and device identification over a
- * proprietary ASCII protocol on custom Zigbee profile 0xC25C ("MIB"):
+ *   Command:   "0s<seq_hex> <command> <params>\r\n"
+ *   Query:     "0g<seq_hex> <command> <params>\r\n"
+ *   Response:  "0r<seq_hex> 000 [data]\r\n"  (000 = success)
+ *   Telemetry: "0t<seq_hex> sa <command> <data>\r\n"
  *
- *   Command format:  "0s<seq_hex> <command> <params>\r\n"
- *   Query format:    "0g<seq_hex> <command> <params>\r\n"
- *   Response format: "0r<seq_hex> 000 [data]\r\n"  (000 = success)
- *   Telemetry:       "0t<seq_hex> sa <command> <data>\r\n"
- *
- * Payloads are bare ASCII with no ZCL framing. Commands are sent to device
- * endpoint 1; responses and telemetry arrive from endpoint 197 (0xC5).
- * Standard Zigbee HA control (genOnOff / genLevelCtrl on endpoint 1,
- * profile 0x0104) handles on/off and dimming.
- *
- * This module is the pure protocol layer: constants, color math, frame
- * formatting, parsing and device classification. It has no zigbee-herdsman
- * dependencies beyond the logger, so it is testable in isolation.
+ * Commands go to device endpoint 1; responses and telemetry arrive from
+ * endpoint 197 (0xC5). Standard on/off and dimming use genOnOff /
+ * genLevelCtrl on endpoint 1 (profile 0x0104).
  */
 
 import {logger} from "./logger";
@@ -26,28 +19,19 @@ import type {KeyValue, Publish, Zh} from "./types";
 
 const NS = "zhc:control4";
 
-/**
- * The raw-send surface this module needs from zigbee-herdsman. Upstream
- * herdsman does not expose it yet; the bharat/zigbee-herdsman control4-prod
- * branch adds Endpoint.sendRaw with exactly this shape (also proposed
- * upstream as a generic escape hatch for non-ZCL vendor protocols).
- */
+// Raw-APS send surface required from zigbee-herdsman (not yet in upstream
+// releases); C4 payloads are bare ASCII with no ZCL framing.
 interface EndpointWithSendRaw {
     sendRaw(clusterId: number, data: Buffer, options?: {profileId?: number; timeout?: number; sendPolicy?: "immediate"}): Promise<void>;
 }
-
-// ─── Protocol Constants ──────────────────────────────────────────────
 
 /** C4 "MIB" profile for text commands (49756) */
 export const C4_MIB_PROFILE = 0xc25c;
 /** Proprietary cluster carrying C4 text frames (NOT genPowerCfg, same ID) */
 export const C4_CLUSTER = 1;
 
-// ─── Button Layout ──────────────────────────────────────────────────
-//
-// All newer C4 devices have a 6-slot chassis. Button IDs are hex (00-05).
-// APD120 dimmer uses only 01 (top rocker) and 04 (bottom rocker); KD120
-// and KC120277 use all six slots.
+// All newer C4 devices have a 6-slot chassis with hex button ids 00-05;
+// the APD120 dimmer uses only 01 (top rocker) and 04 (bottom rocker).
 
 export interface C4Button {
     idx: number;
@@ -74,28 +58,16 @@ export const LED_MODES: Record<string, string> = {
     off: "04", // Color shown when the dimmer load is OFF
 };
 
-// ─── Local Load Paddle ──────────────────────────────────────────────
-//
-// Load-bearing devices (APD120 dimmers, KD keypad-dimmers) expose the two
-// halves of the physical load paddle on a SEPARATE wire-id space from the
-// six configurable button-array slots:
-//   bp/cc/sc 00-05 = the configurable button-array slots (button_1..6)
-//   bp/cc/sc 07    = top/up paddle half
-//   bp/cc/sc 08    = bottom/down paddle half
-// The two spaces coexist on one device. Paddle halves are surfaced as their
-// own paddle_up / paddle_down actions rather than extending the button_N
-// enum, which would produce out-of-enum names consumers drop.
-
+// Load-bearing devices expose the physical paddle halves on wire ids
+// 0x07/0x08, a separate id space from the six button-array slots (00-05);
+// they surface as paddle_up / paddle_down actions rather than button_N.
 export const PADDLE_WIRE_IDS: Record<number, string> = {
-    7: "paddle_up", // wire id 0x07
-    8: "paddle_down", // wire id 0x08
+    7: "paddle_up",
+    8: "paddle_down",
 };
 
 export const PADDLE_TARGETS: readonly string[] = ["paddle_up", "paddle_down"];
 
-// The action variants shared by buttons and paddles: a bare press, a scene
-// change, and click counts 1..4. Buttons and paddles use the same grammar,
-// differing only in the prefix (button_N vs paddle_up / paddle_down).
 function actionVariants(prefix: string): string[] {
     return [`${prefix}_press`, `${prefix}_scene`, `${prefix}_click_1`, `${prefix}_click_2`, `${prefix}_click_3`, `${prefix}_click_4`];
 }
@@ -106,17 +78,9 @@ export const ACTION_VALUES: readonly string[] = [
     ...PADDLE_TARGETS.flatMap(actionVariants),
 ];
 
-// ─── Color Conversion Utilities ─────────────────────────────────────
-//
-// Colors arrive as HS (hue/saturation) or XY (CIE 1931) and must become
-// 6-digit hex RGB for the C4 text protocol.
-//
-// C4 LEDs have a non-linear response: low channel values (like 0x18)
-// produce disproportionately visible light, washing out saturated colors.
-// The C4 Director only sends pure colors (channels at 0x00 or 0xFF).
-// Gamma correction (γ=2.0) compresses low values, making e.g.
-// HSV(241°, 92%, 100%) → 0000ff instead of 1814ff.
-
+// C4 LEDs respond non-linearly (low channel values wash out saturated
+// colors) and only ever show pure colors; gamma 2.0 compresses low values,
+// e.g. HSV(241°, 92%, 100%) → 0000ff instead of 1814ff.
 export const C4_LED_GAMMA = 2.0;
 
 /** Apply gamma to a 0-1 channel value, return 0-255 integer */
@@ -158,7 +122,6 @@ export function xyToRgbHex(x: number, y: number): string {
     return [r, g, b].map((ch) => applyGamma(ch).toString(16).padStart(2, "0")).join("");
 }
 
-/** RGB hex → HS (reverse conversion for state reads) */
 export function rgbHexToHs(hex: string): {hue: number; saturation: number} {
     const r = Number.parseInt(hex.substring(0, 2), 16) / 255;
     const g = Number.parseInt(hex.substring(2, 4), 16) / 255;
@@ -178,8 +141,6 @@ export function rgbHexToHs(hex: string): {hue: number; saturation: number} {
     return {hue: h, saturation: s};
 }
 
-// ─── Sequence Counter ────────────────────────────────────────────────
-
 let seqCounter = Math.floor(Math.random() * 0xffff);
 
 export function nextSeq(): string {
@@ -197,19 +158,13 @@ export function getSeqCounter(): number {
     return seqCounter;
 }
 
-// ─── Protocol Text Formatting ────────────────────────────────────────
-
-/** Format a SET command string (0s prefix) */
 export function formatSetCommand(seq: string, cmdBody: string): string {
     return `0s${seq} ${cmdBody}\r\n`;
 }
 
-/** Format a GET command string (0g prefix) */
 export function formatGetCommand(seq: string, cmdBody: string): string {
     return `0g${seq} ${cmdBody}\r\n`;
 }
-
-// ─── Response Parsers ───────────────────────────────────────────────
 
 /** Parse LED color from response: "0r<seq> 000 c4.dmx.led <RRGGBB>" → hex string or null */
 export function parseLedColorResponse(responseText?: string | null): string | null {
@@ -225,13 +180,10 @@ export function parseDimResponse(responseText?: string | null): string | null {
     return match ? match[1] : null;
 }
 
-/** Extract sequence number from a response: "0r<seq> ..." → seq string or null */
 export function parseResponseSeq(text: string): string | null {
     const match = text.match(/^0r(\w{4})\s/);
     return match ? match[1] : null;
 }
-
-// ─── Button Event Parsing ───────────────────────────────────────────
 
 const loggedUnknownWireIds = new Set<number>();
 
@@ -255,16 +207,8 @@ export interface C4ButtonEvent {
 }
 
 /**
- * Resolve a hex wire id from a c4.dmx.bp/cc/sc frame to an action target.
- * Pure logic (apart from a once-per-id diagnostic log).
- *
- *   0x00-0x05 → button_1..button_6 (the configurable button-array slots)
- *   0x07/0x08 → paddle_up / paddle_down (the local load paddle halves)
- *
- * Any other id (0x06, or 0x09+) is outside every known space: the historical
- * button_(N+1) mapping is kept so nothing that used to flow stops, but it is
- * logged once as an unknown wire id. Returns null only when the hex is
- * unparseable.
+ * Map a bp/cc/sc wire id: 0x00-0x05 → button_1..6, 0x07/0x08 → paddle halves.
+ * Other ids keep the legacy button_(N+1) mapping but are logged once.
  */
 export function resolveButtonTarget(wireIdHex: string): C4ButtonTarget | null {
     const wireId = Number.parseInt(wireIdHex, 16);
@@ -276,16 +220,12 @@ export function resolveButtonTarget(wireIdHex: string): C4ButtonTarget | null {
     if (wireId < 0x00 || wireId > 0x05) {
         if (!loggedUnknownWireIds.has(wireId)) {
             loggedUnknownWireIds.add(wireId);
-            logger.warning(
-                `[C4 BUTTON] Unknown wire id 0x${wireId.toString(16).padStart(2, "0")}: not a button slot (0x00-0x05) or paddle half (0x07/0x08)`,
-                NS,
-            );
+            logger.warning(`Unknown wire id 0x${wireId.toString(16).padStart(2, "0")}: not a button slot (0x00-0x05) or paddle half (0x07/0x08)`, NS);
         }
     }
     return {prefix: `button_${wireId + 1}`, buttonId: wireId + 1};
 }
 
-/** Attach the identity field (buttonId or paddle) for a resolved target. */
 function targetIdentity(target: C4ButtonTarget): {paddle: string} | {buttonId: number | undefined} {
     return target.paddle ? {paddle: target.paddle} : {buttonId: target.buttonId};
 }
@@ -319,32 +259,19 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     return null;
 }
 
-// ─── Load Status Telemetry Parsing ──────────────────────────────────
-//
-// Control4 devices broadcast unsolicited load-status telemetry on every
-// load change, as C4 text frames on EP 197:
-//
-//   0t<seq> sa c4.dmx.ls 00 00 <level> 0078 0000 0000 ...
-//
-// The THIRD data field after "c4.dmx.ls" is the current load level as a
-// hex percent (0x00..0x64). This is how a manual paddle press reports its
-// new level without any ZCL reporting.
-
+/** Parse ls telemetry ("0t<seq> sa c4.dmx.ls ..."): the third data field is the load level as a hex percent (0x00-0x64). */
 export function parseLoadStatus(text: string): {level: number} | null {
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls (\w+) (\w+) (\w+)/);
     if (!match) return null;
 
     const level = Number.parseInt(match[3], 16);
     if (Number.isNaN(level) || level > 0x64) {
-        // Out of the valid 0..100 percent range: treat as unparsed.
-        logger.warning(`[C4 LS] Ignoring out-of-range load level: ${text}`, NS);
+        logger.warning(`Ignoring out-of-range load level: ${text}`, NS);
         return null;
     }
 
     return {level};
 }
-
-// ─── Device Type Detection Logic ─────────────────────────────────────
 
 export type C4DeviceType = "dimmer" | "keypaddim" | "keypad";
 
@@ -353,27 +280,21 @@ export const DIM_TYPE_MAP: Record<string, C4DeviceType> = {
     "02": "keypaddim", // C4-KD120  (reverse-phase, 6 buttons + load)
 };
 
-/** Determine device type from c4.dmx.dim response text. Pure logic. */
+/** Determine device type from c4.dmx.dim response text: any dim code means a load, no response means keypad. */
 export function classifyDeviceType(dimResponseText?: string | null): C4DeviceType {
     const dimType = parseDimResponse(dimResponseText);
     if (dimType && DIM_TYPE_MAP[dimType]) {
         return DIM_TYPE_MAP[dimType];
     }
     if (dimType) {
-        // Unknown dim type but has load: treat as keypaddim
         return "keypaddim";
     }
-    // No response / error = no load = pure keypad
     return "keypad";
 }
 
 /**
- * True when a c4.dmx.dim response is an explicit "no load" answer rather than
- * a dim code. A true keypad ANSWERS the dim probe instead of staying silent:
- * production observed the negative "0r<seq> n01", and the generic error form
- * is "0r<seq> v<NN>" (e.g. v01). Either arrives as a real response that
- * carries no dim code, which proves the device is reachable and drives no
- * load. Pure logic.
+ * True for an explicit "no load" answer to the dim probe ("n01", or the
+ * generic error form "v<NN>"): the device is reachable but drives no load.
  */
 export function isC4DimNegativeResponse(rawText?: string | null): boolean {
     if (!rawText) return false;
@@ -385,16 +306,7 @@ export interface C4DimProbeOutcome {
     dimCode?: string;
 }
 
-/**
- * Classify a c4.dmx.dim probe outcome from its raw response text. Pure logic.
- *
- *   {kind: "heal", dimCode}  a dim code answer proves a load type
- *   {kind: "negative"}       an explicit no-load answer (n01 / v01 error form)
- *   {kind: "silent"}         no response at all (a timeout)
- *
- * The distinction matters for self-heal: a negative answer confirms a keypad
- * immediately, while silence only counts toward the silent-probe budget.
- */
+/** "heal" = a dim code answer (proves a load type), "negative" = explicit no-load answer, "silent" = timeout. */
 export function classifyDimProbeResponse(rawText?: string | null): C4DimProbeOutcome {
     if (rawText == null) return {kind: "silent"};
     const dimCode = parseDimResponse(rawText);
@@ -403,21 +315,8 @@ export function classifyDimProbeResponse(rawText?: string | null): C4DimProbeOut
     return {kind: "silent"};
 }
 
-// ─── Self-Heal Confidence Model ─────────────────────────────────────
-//
-// A c4.dmx.dim probe that times out was historically read as "no load =
-// pure keypad" and persisted forever, so a single transient Zigbee timeout
-// at detection time became a permanent wrong classification. A confidence
-// marker is attached to every keypad verdict:
-//
-//   confirmed: proven by a dim answer, or by N consecutive silent probes
-//   assumed:   a single no-answer probe; may be a timeout artifact
-//
-// Load types (dimmer / keypaddim) are always confirmed: the device answered
-// the dim query, which proves it drives a load. Only "keypad" can be
-// assumed. Legacy stored keypad state that predates this marker is treated
-// as assumed by construction, because production has proven such verdicts
-// can be timeout artifacts.
+// A dim answer proves a load type, but silence may just be a transient
+// timeout, so only keypad verdicts carry an assumed/confirmed marker.
 
 export const C4_CONFIDENCE_CONFIRMED = "confirmed";
 export const C4_CONFIDENCE_ASSUMED = "assumed";
@@ -425,18 +324,10 @@ export const C4_CONFIDENCE_ASSUMED = "assumed";
 /** Consecutive silent dim probes required to upgrade an assumed keypad to confirmed (and stop probing it). */
 export const C4_MAX_SILENT_PROBES = 3;
 
-/**
- * The persisted per-device meta keys (a frozen contract: existing production
- * devices carry these exact snake_case keys in device.meta):
- * c4_device_type, c4_type_confidence, c4_dim_code, c4_silent_probes.
- */
+/** Persisted device.meta keys (frozen contract): c4_device_type, c4_type_confidence, c4_dim_code, c4_silent_probes. */
 export type C4Meta = Record<string, unknown>;
 
-/**
- * Derive the effective confidence of a device's current classification from
- * its herdsman meta. Backward compatible: any keypad verdict without an
- * explicit "confirmed" marker (including legacy stored state) is assumed.
- */
+/** Any keypad verdict without an explicit "confirmed" marker (including legacy state) is assumed. */
 export function effectiveConfidence(meta?: C4Meta): string {
     if (meta && meta.c4_type_confidence === C4_CONFIDENCE_CONFIRMED) {
         return C4_CONFIDENCE_CONFIRMED;
@@ -451,18 +342,8 @@ export interface C4HealEvidence {
 }
 
 /**
- * Given the current classification and a piece of load evidence, decide the
- * corrected device type, or null if no correction is warranted. Pure logic.
- *
- *   dim answer is authoritative: 01 → dimmer, any other code → keypaddim.
- *   ls telemetry: only proves the device drives a load, not which kind, so
- *                  it upgrades an (assumed) keypad or unclassified device to
- *                  keypaddim as the safe default, but never downgrades an
- *                  existing dimmer / keypaddim.
- *   paddle telemetry: a local load paddle half (bp 07/08) only exists on a
- *                  load-bearing device, so it is load proof identical to ls:
- *                  upgrades an assumed keypad / unclassified device to
- *                  keypaddim, never downgrades.
+ * A dim answer is authoritative; ls or paddle telemetry only proves a load
+ * exists, so it upgrades a keypad to keypaddim but never downgrades a load type.
  */
 export function healTypeFromEvidence(currentType: string | undefined | null, evidence: C4HealEvidence): C4DeviceType | null {
     if (evidence && evidence.dimCode != null) {
@@ -476,7 +357,6 @@ export function healTypeFromEvidence(currentType: string | undefined | null, evi
     return null;
 }
 
-/** Get button list for a device type */
 export function getButtonsForDeviceType(deviceType?: string | null): readonly C4Button[] {
     if (deviceType === "dimmer") {
         return BUTTONS.filter((b) => b.idx === 2 || b.idx === 5);
@@ -484,12 +364,9 @@ export function getButtonsForDeviceType(deviceType?: string | null): readonly C4
     return BUTTONS; // keypaddim and keypad use all 6 slots
 }
 
-/** Build state object from a read LED color (flat hex attribute) */
 export function buildLedColorState(buttonIdx: number, suffix: string, hexColor: string): Record<string, string> {
     return {[`c4_led_${buttonIdx}_${suffix}`]: hexColor};
 }
-
-// ─── Color Hex Validation ────────────────────────────────────────────
 
 export function isValidColorHex(str: string): boolean {
     return /^[0-9a-f]{6}$/.test(str);
@@ -498,8 +375,6 @@ export function isValidColorHex(str: string): boolean {
 export function normalizeColorHex(str: string): string {
     return str.replace("#", "").toLowerCase();
 }
-
-// ─── Model Metadata ──────────────────────────────────────────────────
 
 export const MODEL_NAMES: Record<string, string> = {
     dimmer: "C4-APD120",
@@ -514,27 +389,18 @@ export const MODEL_DESCRIPTIONS: Record<string, string> = {
 };
 
 export const GENBASIC_ATTRS: readonly string[] = [
-    "zclVersion", // 0x0000
-    "applicationVersion", // 0x0001
-    "stackVersion", // 0x0002
-    "hwVersion", // 0x0003
-    "manufacturerName", // 0x0004
-    "modelId", // 0x0005
-    "dateCode", // 0x0006
-    "powerSource", // 0x0007
-    "swBuildId", // 0x4000
+    "zclVersion",
+    "applicationVersion",
+    "stackVersion",
+    "hwVersion",
+    "manufacturerName",
+    "modelId",
+    "dateCode",
+    "powerSource",
+    "swBuildId",
 ];
 
-// ═══════════════════════════════════════════════════════════════════════
-// I/O layer (depends on zigbee-herdsman via Zh types + sendRaw)
-// ═══════════════════════════════════════════════════════════════════════
-
-// ─── Core: Send C4 Text Command ─────────────────────────────────────
-//
-// The C4 text protocol sends raw ASCII as the APS payload with NO ZCL
-// framing, via Endpoint.sendRaw. Two verbs: 0s = SET (write), 0g = GET
-// (query). Both follow the same transport framing; only the verb prefix
-// differs.
+// Everything below performs I/O against the device via Endpoint.sendRaw.
 
 export async function sendC4Raw(device: Zh.Device, text: string): Promise<string> {
     const ep = device.getEndpoint(1);
@@ -558,18 +424,9 @@ export async function queryC4(device: Zh.Device, cmdBody: string): Promise<strin
     return await sendC4Raw(device, formatGetCommand(seq, cmdBody));
 }
 
-// ─── Response Queue for Synchronous Query/Response ──────────────────
-//
-// The C4 text protocol is asynchronous: queries are sent to EP 1 and
-// responses arrive from EP 197. This response queue enables awaitable
-// query/response patterns used during device detection and LED reading.
-//
-// 1. queryC4WithResponse() registers a Promise resolver keyed by seq
-// 2. The query is sent to the device
-// 3. The raw fromZigbee handler receives the response and checks here
-// 4. If the seq matches, the Promise is resolved with the response text
-// 5. If the timeout expires, the Promise resolves with null
-
+// Queries go out on EP 1 but responses arrive from EP 197, so awaitable
+// queries register a resolver keyed by seq; the raw fromZigbee handler
+// resolves it when the matching response arrives.
 const pendingQueries = new Map<string, (responseText: string) => void>();
 
 /** Resolve a pending query by response sequence. Returns true when a waiter existed. */
@@ -586,7 +443,7 @@ export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, ti
     return await new Promise((resolve) => {
         const timer = setTimeout(() => {
             pendingQueries.delete(seq);
-            logger.warning(`[C4 Q/R] Timeout for seq ${seq}: ${cmdBody}`, NS);
+            logger.warning(`Timeout for seq ${seq}: ${cmdBody}`, NS);
             resolve(null);
         }, timeoutMs);
 
@@ -599,23 +456,11 @@ export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, ti
         sendC4Raw(device, formatGetCommand(seq, cmdBody)).catch((err) => {
             clearTimeout(timer);
             pendingQueries.delete(seq);
-            logger.warning(`[C4 Q/R] Send failed for seq ${seq}: ${(err as Error).message}`, NS);
+            logger.warning(`Send failed for seq ${seq}: ${(err as Error).message}`, NS);
             resolve(null);
         });
     });
 }
-
-// ─── Device Type Detection ──────────────────────────────────────────
-//
-// A SINGLE C4 query identifies all three device types:
-//   c4.dmx.dim response:
-//     "01" → APD120 (forward-phase dimmer, 2-button rocker)
-//     "02" → KD120  (reverse-phase keypad dimmer, 6 buttons + load)
-//     error/n01 → KC120277 (configurable keypad, 6 buttons, no load)
-//
-// NOTE: probing c4.dmx.led 02 03 (button 02 existence) does NOT work: all
-// C4 devices respond to LED queries for all 6 slots, including the
-// 2-button APD120 (unused slots read 000000).
 
 export interface C4Detection {
     deviceType: C4DeviceType;
@@ -623,30 +468,24 @@ export interface C4Detection {
     confidence: string;
 }
 
+/** Identify the device type with a single c4.dmx.dim query: "01" → dimmer, "02" → keypaddim, error/no answer → keypad. */
 export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> {
-    logger.info(`[C4 DETECT] Probing device ${device.ieeeAddr}...`, NS);
+    logger.info(`Probing device ${device.ieeeAddr}...`, NS);
 
     const dimResp = await queryC4WithResponse(device, "c4.dmx.dim", 3000);
-    logger.info(`[C4 DETECT] c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
+    logger.info(`c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
 
     const dimCode = parseDimResponse(dimResp);
     const deviceType = classifyDeviceType(dimResp);
 
-    // A dim answer proves the load type (confirmed). A no-answer keypad
-    // verdict is low confidence by construction: it may be a transient
-    // Zigbee timeout rather than a true keypad, so the self-heal machinery
-    // is allowed to revisit it later.
+    // A dim answer proves the load type; a no-answer keypad verdict may be a
+    // transient timeout, so it stays low-confidence for later self-heal.
     const confidence = dimCode ? C4_CONFIDENCE_CONFIRMED : C4_CONFIDENCE_ASSUMED;
-    logger.info(`[C4 DETECT] Device type: ${deviceType} (confidence: ${confidence})`, NS);
+    logger.info(`Device type: ${deviceType} (confidence: ${confidence})`, NS);
     return {deviceType, dimCode, confidence};
 }
 
-// ─── Read Stored LED Colors ─────────────────────────────────────────
-//
-// C4 devices store LED colors in firmware (persisted across power cycles
-// and network migrations). This reads all stored colors for the device's
-// button set and returns them as a state update object.
-
+/** Read all LED colors stored in device firmware (persisted across power cycles) as a state update. */
 export async function readStoredColors(device: Zh.Device, deviceType?: string | null): Promise<KeyValue> {
     const buttons = getButtonsForDeviceType(deviceType);
 
@@ -660,49 +499,18 @@ export async function readStoredColors(device: Zh.Device, deviceType?: string | 
             const hex = parseLedColorResponse(resp);
             if (hex) {
                 Object.assign(state, buildLedColorState(btn.idx, suffix, hex));
-                logger.debug(`[C4 DETECT] LED ${btn.id} mode ${mode}: #${hex}`, NS);
+                logger.debug(`LED ${btn.id} mode ${mode}: #${hex}`, NS);
             } else {
-                logger.debug(`[C4 DETECT] LED ${btn.id} mode ${mode}: no response`, NS);
+                logger.debug(`LED ${btn.id} mode ${mode}: no response`, NS);
             }
         }
     }
     return state;
 }
 
-// ─── Debounced Load State Read (manual paddle sync) ─────────────────
-//
-// Control4 devices do NOT support ZCL attribute reporting (the load light
-// is registered with configureReporting: false), so a manual paddle press
-// at the wall never pushes a state update on its own. C4 devices DO answer
-// ZCL reads, and button presses arrive as C4 text telemetry, so every
-// button event schedules a read of the load state (genOnOff.onOff +
-// genLevelCtrl.currentLevel on EP1). The standard light() fromZigbee
-// handlers pick those read responses up and update state/brightness.
-//
-// The read is debounced per device: a dimmer paddle hold emits a burst of
-// events, so the read fires once the device has been quiet for the
-// debounce window, letting the load settle and coalescing the burst.
-
 export const C4_STATE_READ_DEBOUNCE_MS = 750;
 
 const c4StateReadTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-// ─── Throttled Load State Publish (unsolicited ls telemetry) ─────────
-//
-// The primary manual-sync path: Control4 devices push their new load
-// level as c4.dmx.ls telemetry on every load change, so no ZCL read is
-// needed in the common case.
-//
-// This is a THROTTLE, not a coalesce-to-one. Each ls frame stores the
-// latest level and resets a per-device trailing-edge timer; a publish
-// happens once the device has been quiet for C4_LOAD_STATE_DEBOUNCE_MS.
-// The contract: at most one publish per 500 ms quiet window, and the
-// final settled level is ALWAYS published.
-//
-// Publishing uses the standard light() fields (state + brightness). At
-// level 0 only {state: "OFF"} is published, with NO brightness key: the
-// device resumes at its previous level via on_level, so wiping the
-// last-on brightness would only degrade the slider.
 
 export const C4_LOAD_STATE_DEBOUNCE_MS = 500;
 
@@ -713,17 +521,14 @@ interface C4LoadStateEntry {
 
 const c4LoadStateTimers = new Map<string, C4LoadStateEntry>();
 
-// Per-device timestamp (ms) of the most recent ls frame seen. Used to
-// demote the ZCL read to a fallback: if ls telemetry already arrived,
-// the scheduled read is redundant and gets skipped.
+// Timestamp (ms) of the most recent ls frame per device, so the fallback
+// ZCL read can be skipped when telemetry already refreshed the state.
 const c4LastLsSeen = new Map<string, number>();
 
 /**
- * Schedule a trailing-edge debounced publish of load state for a device.
- * Each ls frame stores the latest level and resets the per-device timer;
- * once the device goes quiet for C4_LOAD_STATE_DEBOUNCE_MS, the latest
- * level for that window is published. Also records the ls-seen timestamp
- * so scheduleC4StateRead can skip its fallback read.
+ * Trailing-edge throttle of ls telemetry: each frame resets the timer, so the
+ * final publish always carries the settled level. Level 0 publishes OFF with
+ * no brightness key, preserving the last-on level.
  */
 export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level: number, publish: Publish): void {
     if (!device) return;
@@ -745,20 +550,13 @@ export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level:
 }
 
 /**
- * Schedule a debounced read of the load on/off + level state for a device.
- * Each call resets the per-device timer; the read fires once the device
- * has been quiet for C4_STATE_READ_DEBOUNCE_MS. Pure keypads have no load,
- * so they are skipped. Read failures are logged and swallowed.
- *
- * This is a FALLBACK behind the ls-telemetry path: if an ls frame arrived
- * after the read was scheduled, the debounced load-state publish already
- * refreshed the state, so the read is skipped.
+ * Debounced ZCL read of the load on/off + level (C4 devices support no
+ * attribute reporting); a fallback skipped when ls telemetry already
+ * refreshed the state, and skipped entirely for loadless keypads.
  */
 export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: string | null): void {
     if (!device) return;
 
-    // Pure keypads drive no load, so there is nothing to read. When the
-    // device type is unknown the read is attempted anyway (guarded below).
     if (deviceType === "keypad") return;
 
     const key = device.ieeeAddr;
@@ -769,11 +567,9 @@ export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: 
     const timer = setTimeout(async () => {
         c4StateReadTimers.delete(key);
 
-        // Fallback demotion: if an ls frame arrived after this read was
-        // scheduled, the debounced load-state publish already updated state.
         const lastLs = c4LastLsSeen.get(key);
         if (lastLs !== undefined && lastLs > scheduledAt) {
-            logger.debug(`[C4 STATE] Skipping ZCL read for ${key}; ls telemetry already refreshed state`, NS);
+            logger.debug(`Skipping ZCL read for ${key}; ls telemetry already refreshed state`, NS);
             return;
         }
 
@@ -781,7 +577,7 @@ export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: 
         try {
             ep1 = device.getEndpoint(1);
         } catch (err) {
-            logger.debug(`[C4 STATE] getEndpoint(1) failed: ${(err as Error).message}`, NS);
+            logger.debug(`getEndpoint(1) failed: ${(err as Error).message}`, NS);
             return;
         }
         if (!ep1) return;
@@ -789,33 +585,21 @@ export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: 
         try {
             await ep1.read("genOnOff", ["onOff"]);
         } catch (err) {
-            logger.debug(`[C4 STATE] genOnOff read failed: ${(err as Error).message}`, NS);
+            logger.debug(`genOnOff read failed: ${(err as Error).message}`, NS);
         }
         try {
             await ep1.read("genLevelCtrl", ["currentLevel"]);
         } catch (err) {
-            logger.debug(`[C4 STATE] genLevelCtrl read failed: ${(err as Error).message}`, NS);
+            logger.debug(`genLevelCtrl read failed: ${(err as Error).message}`, NS);
         }
     }, C4_STATE_READ_DEBOUNCE_MS);
 
     c4StateReadTimers.set(key, timer);
 }
 
-// ─── Self-Heal: Reclassification + Active Probe Campaign ─────────────
-//
-// Two mechanisms correct a device mis-classified as keypad by a silent
-// dim-probe timeout, without ever requiring a manual c4_detect:
-//
-//   PASSIVE: any load evidence that arrives on its own (an ls broadcast or
-//   a c4.dmx.dim answer) proves the device drives a load, so it is
-//   reclassified immediately via applyC4Heal.
-//
-//   ACTIVE: for a keypad that is still only "assumed", the dim probe is
-//   re-run a few times (jittered start, exponential backoff) until either
-//   it answers (heal) or it stays silent C4_MAX_SILENT_PROBES times in a
-//   row (upgrade to a confirmed keypad and stop). Confirmed keypads are
-//   never probed again, and the confirmed marker is persisted so a restart
-//   does not restart the campaign from zero.
+// Self-heal for keypad verdicts caused by a silent dim-probe timeout: passive
+// load evidence reclassifies immediately, and assumed keypads get an active
+// re-probe campaign; confirmed keypads are never re-probed.
 
 /** Jitter window for the first probe, spreading radio traffic so a fleet does not all probe at once on startup. */
 export const C4_PROBE_INITIAL_MAX_MS = 60000;
@@ -837,7 +621,6 @@ interface C4MetaFields {
     silentProbes?: number;
 }
 
-/** Persist self-heal fields onto device.meta and flush via device.save(). */
 function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
     if (fields.type !== undefined) device.meta.c4_device_type = fields.type;
     if (fields.confidence !== undefined) device.meta.c4_type_confidence = fields.confidence;
@@ -846,7 +629,6 @@ function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
     if (typeof device.save === "function") device.save();
 }
 
-/** Tear down any in-flight probe campaign for a device. */
 function stopC4ProbeCampaign(device: Zh.Device): void {
     const campaign = c4ProbeCampaigns.get(device.ieeeAddr);
     if (campaign?.timer) clearTimeout(campaign.timer);
@@ -862,13 +644,9 @@ export function resetC4HealState(): void {
 }
 
 /**
- * Reclassify a device from load evidence and persist the correction.
- * Returns the state fragment to publish (containing the frozen-contract
- * c4_device_type plus an extended c4_detect_result), or null when no
- * correction is warranted. Idempotent: once a device is confirmed at the
- * target type, repeat evidence is a no-op so the probe path and the
- * response path can both observe the same answer without double
- * publishing.
+ * Reclassify from load evidence, persist, and return the state fragment to
+ * publish (null when no correction is warranted). Idempotent, so the probe
+ * and response paths can both observe the same answer without double publishing.
  */
 export function applyC4Heal(
     device: Zh.Device | undefined,
@@ -894,14 +672,9 @@ export function applyC4Heal(
         evidenceDesc = "c4.dmx.ls load telemetry";
     }
 
-    logger.info(`[C4 HEAL] ${device.ieeeAddr}: ${currentType ?? "(none)"} -> ${newType} (evidence: ${evidenceDesc})`, NS);
+    logger.info(`${device.ieeeAddr}: ${currentType ?? "(none)"} -> ${newType} (evidence: ${evidenceDesc})`, NS);
 
-    // Reclassification changes c4_device_type at runtime, mirroring the
-    // c4_detect flow exactly: update device.meta + device.save() and publish
-    // the new c4_device_type.
     persistC4Meta(device, {type: newType, confidence: C4_CONFIDENCE_CONFIRMED, dimCode});
-
-    // Load is proven, so any active probe campaign is done.
     stopC4ProbeCampaign(device);
 
     const state: KeyValue = {
@@ -922,17 +695,12 @@ export function applyC4Heal(
     return state;
 }
 
-/**
- * Upgrade an assumed keypad to a confirmed keypad. Called both after
- * enough silence and immediately on an explicit negative dim answer; the
- * evidence/logReason override lets each path record its own proof.
- */
 function markConfirmedC4Keypad(device: Zh.Device, publish?: Publish, opts: {evidence?: string; logReason?: string} = {}): void {
     const evidence = opts.evidence ?? `${C4_MAX_SILENT_PROBES} consecutive silent c4.dmx.dim probes`;
     const logReason = opts.logReason ?? `keypad confirmed after ${C4_MAX_SILENT_PROBES} silent c4.dmx.dim probes`;
 
     persistC4Meta(device, {confidence: C4_CONFIDENCE_CONFIRMED});
-    logger.info(`[C4 HEAL] ${device.ieeeAddr}: ${logReason}`, NS);
+    logger.info(`${device.ieeeAddr}: ${logReason}`, NS);
 
     if (publish) {
         publish({
@@ -950,12 +718,7 @@ function markConfirmedC4Keypad(device: Zh.Device, publish?: Publish, opts: {evid
     }
 }
 
-/**
- * Normalize a probeFn return value into a {kind, dimCode?} outcome. The
- * default probeFn returns a classifyDimProbeResponse object, but the
- * legacy test seam contract is a bare dim code string (heal) or null
- * (silent), so both shapes are accepted.
- */
+// probeFn may also return a bare dim code string or null (legacy test seam).
 function normalizeProbeOutcome(result: C4DimProbeOutcome | string | null | undefined): C4DimProbeOutcome {
     if (result == null) return {kind: "silent"};
     if (typeof result === "object") return result;
@@ -971,12 +734,9 @@ export interface C4ProbeCampaignOpts {
 }
 
 /**
- * Start (once per process) an active dim-probe campaign for an assumed
- * keypad. No-op for non-keypads and for already-confirmed keypads. The
- * first probe is jittered across C4_PROBE_INITIAL_MAX_MS; subsequent
- * silent probes back off exponentially. A dim answer heals via the
- * response path; C4_MAX_SILENT_PROBES silences confirm the keypad and
- * stop the campaign.
+ * Start (once per process) the active dim-probe campaign for an assumed
+ * keypad: a jittered first probe, then exponential backoff, until a dim answer
+ * heals it or C4_MAX_SILENT_PROBES silences confirm it.
  */
 export function scheduleC4ProbeCampaign(
     device: Zh.Device | undefined,
@@ -985,9 +745,9 @@ export function scheduleC4ProbeCampaign(
     opts: C4ProbeCampaignOpts = {},
 ): void {
     if (!device) return;
-    if (deviceType !== "keypad") return; // never probe a load-bearing device
-    if (effectiveConfidence(device.meta) === C4_CONFIDENCE_CONFIRMED) return; // never re-probe a confirmed keypad
-    if (c4ProbeCampaigns.has(device.ieeeAddr)) return; // one campaign per process lifetime
+    if (deviceType !== "keypad") return;
+    if (effectiveConfidence(device.meta) === C4_CONFIDENCE_CONFIRMED) return;
+    if (c4ProbeCampaigns.has(device.ieeeAddr)) return;
 
     const probeFn = opts.probeFn ?? (async (dev: Zh.Device) => classifyDimProbeResponse(await queryC4WithResponse(dev, "c4.dmx.dim", 3000)));
     const random = opts.random ?? Math.random;
@@ -1004,24 +764,21 @@ export function scheduleC4ProbeCampaign(
         try {
             outcome = normalizeProbeOutcome(await probeFn(device));
         } catch (err) {
-            logger.warning(`[C4 HEAL] Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
+            logger.warning(`Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
             outcome = {kind: "silent"};
         }
 
         if (outcome.kind === "heal") {
-            // The dim response also flows through the raw fromZigbee handler,
-            // which heals and publishes; applyC4Heal here is idempotent
-            // (no-op if already healed) so the injected-probe path still heals.
+            // The dim response also flows through the raw fromZigbee handler;
+            // applyC4Heal is idempotent so both paths can observe the answer.
             applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
             c4ProbeCampaigns.delete(device.ieeeAddr);
             return;
         }
 
         if (outcome.kind === "negative") {
-            // A true keypad answers the dim probe with an explicit no-load
-            // response rather than timing out. That is proof, not silence, so
-            // confirm immediately instead of burning the silent-probe budget
-            // and its exponential backoff.
+            // An explicit no-load answer is proof, not silence: confirm now
+            // instead of burning the silent-probe budget.
             markConfirmedC4Keypad(device, publish, {
                 logReason: "keypad confirmed by explicit n01 answer",
                 evidence: "explicit n01 answer",
@@ -1045,25 +802,10 @@ export function scheduleC4ProbeCampaign(
     campaign.timer = setTimeout(runProbe, Math.floor(random() * initialMaxMs));
 }
 
-// ─── Startup Arming of the Probe Campaign ───────────────────────────
-//
-// scheduleC4ProbeCampaign was originally only kicked off from the raw
-// fromZigbee handler, so a device had to emit C4 text traffic before its
-// campaign armed. Quiet keypads never did, so in production 6 of 8
-// devices sat unprobed. Every assumed-keypad device is now armed at
-// startup via the definition's onEvent "start" hook. A device whose
-// stored classification is a load type (dimmer / keypaddim) or a
-// confirmed keypad is skipped by scheduleC4ProbeCampaign; an absent
-// classification is treated as an assumed keypad so a never-detected
-// device still gets probed. The per-device jitter inside the campaign
-// keeps a fleet from probing at once, and the fz-side arming stays as an
-// idempotent supplement.
-
 /**
- * Arm the self-heal probe campaign for assumed-keypad (or unclassified)
- * devices when the bridge starts. Called from the definition's onEvent
- * handler with the event's device and state; the opts parameter is a test
- * seam forwarded to scheduleC4ProbeCampaign.
+ * Arm the self-heal probe campaign at bridge start, so quiet devices get probed
+ * without having to emit traffic first; an absent classification counts as an
+ * assumed keypad so a never-detected device is still probed.
  */
 export function c4ArmProbeOnStart(device: Zh.Device | undefined, state: KeyValue | undefined, opts: C4ProbeCampaignOpts = {}): void {
     if (!device) return;
@@ -1072,10 +814,6 @@ export function c4ArmProbeOnStart(device: Zh.Device | undefined, state: KeyValue
     scheduleC4ProbeCampaign(device, currentType, opts.publish, opts);
 }
 
-/**
- * Short device identity for log attribution: the ieeeAddr, plus the
- * friendly name when the device object carries one cheaply.
- */
 export function c4DeviceLabel(device: Zh.Device | undefined): string {
     if (!device) return "?";
     const ieee = device.ieeeAddr ?? "?";
