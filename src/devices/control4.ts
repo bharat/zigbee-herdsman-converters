@@ -332,6 +332,33 @@ const tzControl4Detect = {
     },
 } satisfies Tz.Converter;
 
+// Read-back verification for one slot (issue #145): {"c4_verify_slot": N}
+// reads slot N's stored config and publishes the observed values together
+// with a c4_verified_slot correlation marker in a single payload, which is
+// what the control4_dimmers integration awaits. The marker is then
+// immediately cleared (null removes it from the Z2M state cache) so later
+// unrelated state publishes cannot echo a stale marker into a future verify
+// pass and resolve it with stale observed values (the same retained-read
+// trap that bit the raw c4_response interface).
+const tzControl4VerifySlot = {
+    key: ["c4_verify_slot"],
+    convertSet: async (entity, key, value, meta) => {
+        if (!meta.device) throw new Error("c4_verify_slot requires a device");
+        const slotId = typeof value === "number" ? value : Number.parseInt(String(value), 10);
+        if (!Number.isInteger(slotId) || slotId < 1 || slotId > c4.BUTTONS.length) {
+            throw new Error(`c4_verify_slot expects a slot id 1-${c4.BUTTONS.length}, got "${value}"`);
+        }
+
+        const observed = await c4.readStoredSlotConfig(meta.device, slotId);
+        logger.debug(`${c4.c4DeviceLabel(meta.device)} verify slot ${slotId}: ${JSON.stringify(observed)}`, NS);
+
+        // Publish directly (rather than returning state) so the marker clear
+        // is guaranteed to follow the verify payload in order.
+        meta.publish({...observed, c4_verified_slot: slotId});
+        meta.publish({c4_verified_slot: null});
+    },
+} satisfies Tz.Converter;
+
 export const definitions: DefinitionWithExtend[] = [
     {
         zigbeeModel: [
@@ -351,7 +378,7 @@ export const definitions: DefinitionWithExtend[] = [
         extend: [m.light({configureReporting: false})],
         exposes: [e.action([...c4.ACTION_VALUES])],
         fromZigbee: [fzControl4Response],
-        toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect],
+        toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect, tzControl4VerifySlot],
         meta: {disableDefaultResponse: true},
         // Arm the self-heal probe campaign for quiet assumed-keypads at
         // startup (the light() extend adds no onEvent).

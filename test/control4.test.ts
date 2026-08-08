@@ -35,6 +35,7 @@ import {
     parseDimResponse,
     parseLedColorResponse,
     parseLoadStatus,
+    parseParamResponse,
     parseResponseSeq,
     resetC4ButtonLogState,
     resetSeqCounter,
@@ -343,6 +344,44 @@ describe("Control4 protocol", () => {
 
         it("returns null for unrelated response", () => {
             expect(parseLedColorResponse("0r0001 000 c4.dmx.dim 01")).toBeNull();
+        });
+    });
+
+    describe("parseParamResponse", () => {
+        it("extracts a led param byte", () => {
+            expect(parseParamResponse("led", "0ra9c8 000 c4.dmx.led 02")).toBe("02");
+        });
+
+        it("extracts a btn param byte", () => {
+            expect(parseParamResponse("btn", "0r0001 000 c4.dmx.btn 03")).toBe("03");
+        });
+
+        it("normalizes a single hex digit to two digits", () => {
+            expect(parseParamResponse("led", "0r0001 000 c4.dmx.led 2")).toBe("02");
+        });
+
+        it("lowercases uppercase hex", () => {
+            expect(parseParamResponse("btn", "0r0001 000 c4.dmx.btn 0A")).toBe("0a");
+        });
+
+        it("does not match a 6-digit color response", () => {
+            expect(parseParamResponse("led", "0r0001 000 c4.dmx.led ff0000")).toBeNull();
+        });
+
+        it("requires the matching command", () => {
+            expect(parseParamResponse("btn", "0r0001 000 c4.dmx.led 02")).toBeNull();
+            expect(parseParamResponse("led", "0r0001 000 c4.dmx.btn 03")).toBeNull();
+        });
+
+        it("returns null for error responses", () => {
+            expect(parseParamResponse("led", "0ra9c8 e00")).toBeNull();
+            expect(parseParamResponse("btn", "0ra9c8 v01")).toBeNull();
+        });
+
+        it("returns null for null, undefined and empty input", () => {
+            expect(parseParamResponse("led", null)).toBeNull();
+            expect(parseParamResponse("led", undefined)).toBeNull();
+            expect(parseParamResponse("led", "")).toBeNull();
         });
     });
 

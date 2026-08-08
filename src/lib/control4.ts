@@ -508,6 +508,92 @@ export async function readStoredColors(device: Zh.Device, deviceType?: string | 
     return state;
 }
 
+// Reverse maps for read-back verification (issue #145): firmware value →
+// the name the control4_dimmers integration publishes and compares. Each
+// table must EXACTLY invert the integration's _BEHAVIOR_TO_FIRMWARE /
+// _LED_MODE_TO_FIRMWARE; a wrong entry makes verify report a false mismatch
+// on a correctly-configured device. Values are hardware-confirmed (#145).
+
+/** Firmware button behavior (read via "c4.dmx.btn NN 01") → integration behavior name. */
+export const BEHAVIOR_FROM_FIRMWARE: Record<string, string> = {
+    "00": "load_on",
+    "01": "load_off",
+    "02": "toggle_load",
+    "03": "keypad",
+};
+
+/**
+ * Firmware LED mode (the param-01 selector, read via "c4.dmx.led NN 01") →
+ * integration mode name. Firmware "programmed" (00) is called "fixed" on the
+ * HA side, but the integration compares against the firmware name.
+ */
+export const LED_MODE_FROM_FIRMWARE: Record<string, string> = {
+    "00": "programmed",
+    "01": "follow_load",
+    "02": "push_release",
+};
+
+/**
+ * Parse a single-byte parameter read response:
+ * "0r<seq> 000 c4.dmx.led 02" → "02" (normalized 2-digit lowercase hex) or
+ * null. The 1-2 hex-digit anchor cannot match a 6-digit color response, so a
+ * crossed-up reply parses as null rather than garbage.
+ */
+export function parseParamResponse(cmd: "led" | "btn", responseText?: string | null): string | null {
+    if (!responseText) return null;
+    const match = responseText.match(new RegExp(`000 c4\\.dmx\\.${cmd} ([0-9a-fA-F]{1,2})$`));
+    if (!match) return null;
+    return match[1].toLowerCase().padStart(2, "0");
+}
+
+/**
+ * Read one slot's stored config for read-back verification (issue #145):
+ * on/off LED colors, the LED mode selector, and the button behavior, as the
+ * exact state keys the control4_dimmers integration ingests. A key is absent
+ * when its read timed out (the integration skips absent fields as unreadable
+ * rather than treating them as drift). An unmapped firmware value is
+ * published raw so it surfaces as a loud mismatch the integration can
+ * re-push, instead of silently passing verification.
+ */
+export async function readStoredSlotConfig(device: Zh.Device, slotId: number): Promise<KeyValue> {
+    const btn = BUTTONS.find((b) => b.idx === slotId);
+    if (!btn) throw new Error(`Invalid slot id ${slotId}, expected 1-${BUTTONS.length}`);
+
+    const state: KeyValue = {};
+
+    for (const [mode, suffix] of [
+        ["03", "on"],
+        ["04", "off"],
+    ]) {
+        const resp = await queryC4WithResponse(device, `c4.dmx.led ${btn.id} ${mode}`, 2000);
+        const hex = parseLedColorResponse(resp);
+        if (hex) state[`c4_led_${slotId}_${suffix}`] = hex;
+        else logger.debug(`Slot ${slotId} LED ${suffix} color: no response`, NS);
+    }
+
+    const modeResp = await queryC4WithResponse(device, `c4.dmx.led ${btn.id} 01`, 2000);
+    const modeVal = parseParamResponse("led", modeResp);
+    if (modeVal) {
+        const modeName = LED_MODE_FROM_FIRMWARE[modeVal];
+        if (!modeName) logger.warning(`Slot ${slotId} LED mode read returned unknown value ${modeVal}`, NS);
+        state[`button_${slotId}_led_mode`] = modeName ?? modeVal;
+    } else {
+        logger.debug(`Slot ${slotId} LED mode: no response`, NS);
+    }
+
+    const behaviorResp = await queryC4WithResponse(device, `c4.dmx.btn ${btn.id} 01`, 2000);
+    const behaviorVal = parseParamResponse("btn", behaviorResp);
+    if (behaviorVal) {
+        const behaviorName = BEHAVIOR_FROM_FIRMWARE[behaviorVal];
+        if (!behaviorName) logger.warning(`Slot ${slotId} behavior read returned unknown value ${behaviorVal}`, NS);
+        state[`button_${slotId}_behavior`] = behaviorName ?? behaviorVal;
+    } else {
+        logger.debug(`Slot ${slotId} behavior: no response`, NS);
+    }
+
+    return state;
+}
+
 export const C4_STATE_READ_DEBOUNCE_MS = 750;
 
 const c4StateReadTimers = new Map<string, ReturnType<typeof setTimeout>>();
