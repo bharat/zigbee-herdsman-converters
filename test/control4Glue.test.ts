@@ -11,6 +11,7 @@ import {definitions} from "../src/devices/control4";
 import {
     ACTION_VALUES,
     applyC4Heal,
+    BEHAVIOR_FROM_FIRMWARE,
     C4_CONFIDENCE_ASSUMED,
     C4_CONFIDENCE_CONFIRMED,
     C4_LOAD_STATE_DEBOUNCE_MS,
@@ -21,7 +22,10 @@ import {
     effectiveConfidence,
     healTypeFromEvidence,
     isC4DimNegativeResponse,
+    LED_MODE_FROM_FIRMWARE,
+    readStoredSlotConfig,
     resetC4HealState,
+    resolveC4PendingQuery,
     scheduleC4LoadStatePublish,
     scheduleC4ProbeCampaign,
     scheduleC4StateRead,
@@ -763,6 +767,162 @@ describe("Control4 glue", () => {
         });
     });
 
+    describe("readStoredSlotConfig / c4_verify_slot (read-back verification)", () => {
+        // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the tz convert signature
+        type AnyFn = (...args: any[]) => any;
+        const definition = definitions[0];
+        const tzVerify = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_verify_slot"));
+        const convertSet = tzVerify?.convertSet as AnyFn;
+
+        /** Answer body (without the "0r<seq> " prefix) per query body, or null for silence. */
+        type C4Responder = (cmdBody: string) => string | null;
+
+        /** Slot 3 (wire id 02) fully readable: red on, black off, push_release, keypad. */
+        const slot3Answers: Record<string, string> = {
+            "c4.dmx.led 02 03": "000 c4.dmx.led ff0000",
+            "c4.dmx.led 02 04": "000 c4.dmx.led 000000",
+            "c4.dmx.led 02 01": "000 c4.dmx.led 02",
+            "c4.dmx.btn 02 01": "000 c4.dmx.btn 03",
+        };
+
+        /**
+         * A device whose EP1 answers C4 queries through the real pending-query
+         * machinery: sendRaw parses the outgoing "0g<seq> <body>" frame and
+         * resolves it on a microtask, like a response arriving from EP 197.
+         */
+        function makeRespondingDevice(ieeeAddr: string, respond: C4Responder): {device: MockDevice; sent: string[]} {
+            const sent: string[] = [];
+            const ep1 = {
+                ID: 1,
+                read: vi.fn(async () => ({})),
+                command: vi.fn(async () => ({})),
+                sendRaw: vi.fn((_cluster: number, data: Buffer): Promise<void> => {
+                    const text = data.toString("ascii").trim();
+                    const match = text.match(/^0g(\w{4}) (.+)$/);
+                    if (match) {
+                        const [, seq, cmdBody] = match;
+                        sent.push(cmdBody);
+                        const answer = respond(cmdBody);
+                        // null answer = silence: let the query time out
+                        if (answer !== null) {
+                            queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                        }
+                    }
+                    return Promise.resolve();
+                }),
+            };
+            const device: MockDevice = {
+                ieeeAddr,
+                meta: {},
+                save: vi.fn(),
+                getEndpoint: vi.fn((id: number) => (id === 1 ? (ep1 as unknown as MockEndpoint) : undefined)),
+            };
+            return {device, sent};
+        }
+
+        it("reads one slot as the exact state keys the integration ingests", async () => {
+            const {device, sent} = makeRespondingDevice("0x0F01", (cmd) => slot3Answers[cmd] ?? null);
+
+            const state = await readStoredSlotConfig(asDevice(device), 3);
+
+            expect(state).toEqual({
+                c4_led_3_on: "ff0000",
+                c4_led_3_off: "000000",
+                button_3_led_mode: "push_release",
+                button_3_behavior: "keypad",
+            });
+            // Slot 3 is wire id 02; behavior comes from btn param 01.
+            expect(sent).toEqual(["c4.dmx.led 02 03", "c4.dmx.led 02 04", "c4.dmx.led 02 01", "c4.dmx.btn 02 01"]);
+        });
+
+        it("omits keys whose read timed out instead of reporting them as drift", async () => {
+            vi.useFakeTimers();
+            try {
+                const {device} = makeRespondingDevice("0x0F02", (cmd) => (cmd === "c4.dmx.btn 02 01" ? null : (slot3Answers[cmd] ?? null)));
+
+                const promise = readStoredSlotConfig(asDevice(device), 3);
+                await vi.advanceTimersByTimeAsync(10000);
+                const state = await promise;
+
+                expect(state).toEqual({
+                    c4_led_3_on: "ff0000",
+                    c4_led_3_off: "000000",
+                    button_3_led_mode: "push_release",
+                });
+            } finally {
+                vi.runOnlyPendingTimers();
+                vi.useRealTimers();
+            }
+        });
+
+        it("publishes an unmapped firmware value raw so it mismatches loudly", async () => {
+            const answers = {...slot3Answers, "c4.dmx.btn 02 01": "000 c4.dmx.btn 05"};
+            const {device} = makeRespondingDevice("0x0F03", (cmd) => answers[cmd] ?? null);
+
+            const state = await readStoredSlotConfig(asDevice(device), 3);
+
+            expect(state.button_3_behavior).toBe("05");
+            expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining("unknown value 05"), "zhc:control4");
+        });
+
+        it("rejects out-of-range slot ids", async () => {
+            const {device} = makeRespondingDevice("0x0F04", () => null);
+            await expect(readStoredSlotConfig(asDevice(device), 0)).rejects.toThrow("Invalid slot id");
+            await expect(readStoredSlotConfig(asDevice(device), 7)).rejects.toThrow("Invalid slot id");
+        });
+
+        it("tz publishes observed values with the marker, then clears the marker", async () => {
+            const {device} = makeRespondingDevice("0x0F05", (cmd) => slot3Answers[cmd] ?? null);
+            const publish = vi.fn();
+
+            await convertSet(undefined, "c4_verify_slot", 3, {device: asDevice(device), publish, state: {}, message: {c4_verify_slot: 3}});
+
+            expect(publish).toHaveBeenCalledTimes(2);
+            expect(publish.mock.calls[0][0]).toEqual({
+                c4_led_3_on: "ff0000",
+                c4_led_3_off: "000000",
+                button_3_led_mode: "push_release",
+                button_3_behavior: "keypad",
+                c4_verified_slot: 3,
+            });
+            expect(publish.mock.calls[1][0]).toEqual({c4_verified_slot: null});
+        });
+
+        it("tz still publishes the marker when every read times out", async () => {
+            vi.useFakeTimers();
+            try {
+                const {device} = makeRespondingDevice("0x0F06", () => null);
+                const publish = vi.fn();
+
+                const promise = convertSet(undefined, "c4_verify_slot", 2, {
+                    device: asDevice(device),
+                    publish,
+                    state: {},
+                    message: {c4_verify_slot: 2},
+                });
+                await vi.advanceTimersByTimeAsync(10000);
+                await promise;
+
+                // An all-absent payload resolves the integration's wait as
+                // "unreadable" rather than leaving it to hit its own timeout.
+                expect(publish.mock.calls[0][0]).toEqual({c4_verified_slot: 2});
+                expect(publish.mock.calls[1][0]).toEqual({c4_verified_slot: null});
+            } finally {
+                vi.runOnlyPendingTimers();
+                vi.useRealTimers();
+            }
+        });
+
+        it("tz rejects a non-numeric or out-of-range slot id", async () => {
+            const {device} = makeRespondingDevice("0x0F07", () => null);
+            const meta = {device: asDevice(device), publish: vi.fn(), state: {}, message: {}};
+
+            await expect(convertSet(undefined, "c4_verify_slot", "abc", meta)).rejects.toThrow("expects a slot id");
+            await expect(convertSet(undefined, "c4_verify_slot", 0, meta)).rejects.toThrow("expects a slot id");
+            await expect(convertSet(undefined, "c4_verify_slot", 7, meta)).rejects.toThrow("expects a slot id");
+        });
+    });
+
     describe("Frozen MQTT contract", () => {
         const definition = definitions[0];
 
@@ -793,9 +953,26 @@ describe("Control4 glue", () => {
 
         it("toZigbee accepts the frozen command keys", () => {
             const keys = (definition.toZigbee ?? []).flatMap((tz) => tz.key ?? []);
-            for (const frozen of ["c4_led", "c4_cmd", "c4_query", "zcl_read", "c4_probe", "c4_detect"]) {
+            for (const frozen of ["c4_led", "c4_cmd", "c4_query", "zcl_read", "c4_probe", "c4_detect", "c4_verify_slot"]) {
                 expect(keys).toContain(frozen);
             }
+        });
+
+        it("read-back reverse maps exactly invert the integration's firmware tables", () => {
+            // Must mirror control4_dimmers' _BEHAVIOR_TO_FIRMWARE and
+            // _LED_MODE_TO_FIRMWARE (param 01); values hardware-confirmed in
+            // issue #145. A drift here makes verify lie in both directions.
+            expect(BEHAVIOR_FROM_FIRMWARE).toEqual({
+                "00": "load_on",
+                "01": "load_off",
+                "02": "toggle_load",
+                "03": "keypad",
+            });
+            expect(LED_MODE_FROM_FIRMWARE).toEqual({
+                "00": "programmed",
+                "01": "follow_load",
+                "02": "push_release",
+            });
         });
 
         it("definition model and vendor are stable", () => {
