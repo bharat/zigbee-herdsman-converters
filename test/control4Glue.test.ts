@@ -11,6 +11,7 @@ import {definitions} from "../src/devices/control4";
 import {
     ACTION_VALUES,
     applyC4Heal,
+    applyC4Identity,
     BEHAVIOR_FROM_FIRMWARE,
     C4_CONFIDENCE_ASSUMED,
     C4_CONFIDENCE_CONFIRMED,
@@ -23,6 +24,8 @@ import {
     healTypeFromEvidence,
     isC4DimNegativeResponse,
     LED_MODE_FROM_FIRMWARE,
+    parseC4Identity,
+    readC4Identity,
     readStoredSlotConfig,
     resetC4HealState,
     resolveC4PendingQuery,
@@ -923,6 +926,72 @@ describe("Control4 glue", () => {
         });
     });
 
+    describe("Device identity (profile 0xC25D)", () => {
+        // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+        type AnyFn = (...args: any[]) => any;
+        const definition = definitions[0];
+        const fzConvert = (definition.fromZigbee as unknown as [unknown, {convert: AnyFn}])[1].convert;
+        const report = {4: "5.1.1", 7: "c4:control4_light:C4-KD120"};
+
+        function convert(endpointId: number, device: MockDevice, state: KeyValue = {}): Promise<KeyValue | undefined> {
+            const msg = {data: report, endpoint: {ID: endpointId}, device, type: "attributeReport", cluster: "genPowerCfg"};
+            return fzConvert(definition, msg, vi.fn(), {}, {state, device});
+        }
+
+        it("parses the model out of the c4:<class>:<model> string and the firmware", () => {
+            expect(parseC4Identity(report)).toEqual({model: "C4-KD120", firmware: "5.1.1"});
+            expect(parseC4Identity({7: "C4-APD120"})).toEqual({model: "C4-APD120"});
+            expect(parseC4Identity({})).toEqual({});
+        });
+
+        it("publishes and stores model and firmware from an endpoint 2 report", async () => {
+            const {device} = makeDevice("0x0F01");
+            expect(await convert(2, device)).toEqual({c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            expect(device.meta.c4_model).toBe("C4-KD120");
+            expect(device.meta.c4_firmware).toBe("5.1.1");
+            // Shown by Zigbee2MQTT as the model (via whiteLabel) and firmware
+            expect((device as unknown as Zh.Device).modelID).toBe("C4-KD120");
+            expect((device as unknown as Zh.Device).softwareBuildID).toBe("5.1.1");
+            expect(device.save).toHaveBeenCalledTimes(1);
+        });
+
+        it("leaves the placeholder modelID alone for a model the definition does not list", () => {
+            const {device} = makeDevice("0x0F05");
+            Object.assign(device, {modelID: "C4-Zigbee"});
+            applyC4Identity(asDevice(device), {model: "C4-NEW999", firmware: "6.0.0"}, {});
+            expect((device as unknown as Zh.Device).modelID).toBe("C4-Zigbee");
+            expect(device.meta.c4_model).toBe("C4-NEW999");
+        });
+
+        it("publishes nothing when the repeated report has not changed", async () => {
+            const {device} = makeDevice("0x0F02", {c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            Object.assign(device, {modelID: "C4-KD120", softwareBuildID: "5.1.1"});
+            expect(await convert(2, device, {c4_model: "C4-KD120", c4_firmware: "5.1.1"})).toBeUndefined();
+            expect(device.save).not.toHaveBeenCalled();
+        });
+
+        it("ignores genPowerCfg frames from other endpoints", async () => {
+            const {device} = makeDevice("0x0F03");
+            expect(await convert(1, device)).toBeUndefined();
+            expect(applyC4Identity(asDevice(device), {}, {})).toBeUndefined();
+        });
+
+        it("reads both attributes on endpoint 2 with the identity profile and no manufacturer code", async () => {
+            const read = vi.fn(async () => report);
+            const ep2 = {ID: 2, read};
+            const device = {
+                ieeeAddr: "0x0F04",
+                meta: {},
+                save: vi.fn(),
+                getEndpoint: vi.fn(() => undefined),
+                createEndpoint: vi.fn(() => ep2),
+            };
+            expect(await readC4Identity(device as unknown as Zh.Device)).toEqual({model: "C4-KD120", firmware: "5.1.1"});
+            expect(device.createEndpoint).toHaveBeenCalledWith(2);
+            expect(read).toHaveBeenCalledWith(1, [0x0004, 0x0007], {profileId: 0xc25d, srcEndpoint: 2, timeout: 10000});
+        });
+    });
+
     describe("Frozen MQTT contract", () => {
         const definition = definitions[0];
 
@@ -978,6 +1047,14 @@ describe("Control4 glue", () => {
         it("definition model and vendor are stable", () => {
             expect(definition.model).toBe("C4-Zigbee");
             expect(definition.vendor).toBe("Control4");
+        });
+
+        it("whiteLabels every identity model and lists it as a zigbeeModel", () => {
+            const models = ["C4-APD120", "C4-KD120", "C4-KC120277", "C4-SW120277"];
+            expect((definition.whiteLabel ?? []).map((w) => w.model)).toEqual(models);
+            for (const model of models) {
+                expect(definition.zigbeeModel).toContain(model);
+            }
         });
 
         it("fingerprint matches on the Control4 manufacturer ID", () => {
