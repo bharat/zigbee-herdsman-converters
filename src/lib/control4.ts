@@ -30,6 +30,94 @@ export const C4_MIB_PROFILE = 0xc25c;
 /** Proprietary cluster carrying C4 text frames (NOT genPowerCfg, same ID) */
 export const C4_CLUSTER = 1;
 
+/** C4 identity profile (49757): devices report, and answer reads for, their model and firmware */
+export const C4_IDENTITY_PROFILE = 0xc25d;
+/** Endpoint the identity attributes live on (absent from the simple descriptors) */
+export const C4_IDENTITY_ENDPOINT = 2;
+/** Identity attributes on C4_CLUSTER: firmware version and a "c4:<class>:<model>" string */
+export const C4_ATTR_FIRMWARE = 0x0004;
+export const C4_ATTR_MODEL = 0x0007;
+
+/**
+ * Models the reported identity may name, and how they are shown. The
+ * reported model replaces the "C4-Zigbee" placeholder modelID (genBasic is
+ * unreadable on these devices), which lets the definition's whiteLabel show
+ * the real model; models not listed here leave the modelID alone so the
+ * definition still matches.
+ */
+export const C4_IDENTITY_MODELS: Record<string, string> = {
+    "C4-APD120": "Adaptive phase dimmer",
+    "C4-KD120": "Keypad dimmer",
+    "C4-KC120277": "Configurable keypad",
+    "C4-SW120277": "Switch",
+};
+
+export interface C4Identity {
+    model?: string;
+    firmware?: string;
+}
+
+/** Extract model and firmware from an identity report or read response (keyed by raw attribute ID). */
+export function parseC4Identity(data: KeyValue): C4Identity {
+    const identity: C4Identity = {};
+    const model = data[C4_ATTR_MODEL];
+    if (typeof model === "string") {
+        // "c4:control4_light:C4-APD120" -> "C4-APD120"
+        identity.model = /^c4:[^:]*:(.+)$/.exec(model)?.[1] ?? model;
+    }
+    const firmware = data[C4_ATTR_FIRMWARE];
+    if (typeof firmware === "string") {
+        identity.firmware = firmware;
+    }
+    return identity;
+}
+
+/**
+ * Store a parsed identity on the device (meta, plus modelID and
+ * softwareBuildID, which Zigbee2MQTT shows as the model and firmware) and
+ * return the c4_model /
+ * c4_firmware state that changed, or undefined when nothing did (the
+ * identity report repeats about once a minute).
+ */
+export function applyC4Identity(device: Zh.Device | undefined, identity: C4Identity, state: KeyValue | undefined): KeyValue | undefined {
+    const changed: KeyValue = {};
+    if (identity.model && state?.c4_model !== identity.model) changed.c4_model = identity.model;
+    if (identity.firmware && state?.c4_firmware !== identity.firmware) changed.c4_firmware = identity.firmware;
+
+    if (device) {
+        let dirty = false;
+        if (identity.model && device.meta.c4_model !== identity.model) {
+            device.meta.c4_model = identity.model;
+            dirty = true;
+        }
+        if (identity.model && identity.model in C4_IDENTITY_MODELS && device.modelID !== identity.model) {
+            device.modelID = identity.model;
+            dirty = true;
+        }
+        if (identity.firmware && (device.meta.c4_firmware !== identity.firmware || device.softwareBuildID !== identity.firmware)) {
+            device.meta.c4_firmware = identity.firmware;
+            device.softwareBuildID = identity.firmware;
+            dirty = true;
+        }
+        if (dirty) device.save();
+    }
+    return Object.keys(changed).length > 0 ? changed : undefined;
+}
+
+/**
+ * Read model and firmware on demand. A plain global read: with a
+ * manufacturer code the device rejects it (default response 0x84).
+ */
+export async function readC4Identity(device: Zh.Device): Promise<C4Identity> {
+    const endpoint = device.getEndpoint(C4_IDENTITY_ENDPOINT) ?? device.createEndpoint(C4_IDENTITY_ENDPOINT);
+    const result = await endpoint.read(C4_CLUSTER, [C4_ATTR_FIRMWARE, C4_ATTR_MODEL], {
+        profileId: C4_IDENTITY_PROFILE,
+        srcEndpoint: C4_IDENTITY_ENDPOINT,
+        timeout: 10000,
+    });
+    return parseC4Identity(result as KeyValue);
+}
+
 // All newer C4 devices have a 6-slot chassis with hex button ids 00-05;
 // the APD120 dimmer uses only 01 (top rocker) and 04 (bottom rocker).
 
