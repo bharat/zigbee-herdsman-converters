@@ -2,7 +2,8 @@ import * as c4 from "../lib/control4";
 import * as exposes from "../lib/exposes";
 import {logger} from "../lib/logger";
 import * as m from "../lib/modernExtend";
-import type {DefinitionWithExtend, Fz, KeyValue, Tz, Zh} from "../lib/types";
+import type {DefinitionWithExtend, Expose, Fz, KeyValue, KeyValueAny, ModernExtend, Tz, Zh} from "../lib/types";
+import {isDummyDevice} from "../lib/utils";
 
 const e = exposes.presets;
 const NS = "zhc:control4";
@@ -13,6 +14,18 @@ const NS = "zhc:control4";
 async function readLoose(ep: Zh.Endpoint, cluster: string | number, attrs: (string | number)[]): Promise<KeyValue> {
     const read = ep.read as unknown as (c: string | number, a: (string | number)[], o?: {timeout?: number}) => Promise<KeyValue | undefined>;
     return (await read.call(ep, cluster, attrs, {timeout: 10000})) ?? {};
+}
+
+// On/off-only models (by reported identity) get a light without brightness;
+// everything else, including devices whose identity isn't known yet, dims.
+function c4Light(): ModernExtend {
+    const light = m.light({configureReporting: false});
+    const [dimmable, ...rest] = light.exposes as Expose[];
+    const onOff = e.light();
+    return {
+        ...light,
+        exposes: [(device) => [!isDummyDevice(device) && c4.C4_ONOFF_MODELS.includes(device.modelID) ? onOff : dimmable, ...rest]],
+    };
 }
 
 // C4 responses and telemetry arrive as raw ASCII from endpoint 197, profile
@@ -123,7 +136,11 @@ const fzControl4Identity = {
     type: ["attributeReport", "readResponse"],
     convert: (model, msg, publish, options, meta) => {
         if (msg.endpoint?.ID !== c4.C4_IDENTITY_ENDPOINT) return;
-        return c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
+        const modelID = msg.device.modelID;
+        const result = c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
+        // The new model can change the exposes (see c4Light).
+        if (msg.device.modelID !== modelID) meta.deviceExposesChanged();
+        return result;
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["attributeReport", "readResponse"]>;
 
@@ -394,11 +411,22 @@ export const definitions: DefinitionWithExtend[] = [
             description,
             fingerprint: [{modelID: model}],
         })),
-        extend: [m.light({configureReporting: false})],
+        extend: [c4Light()],
         exposes: [e.action([...c4.ACTION_VALUES])],
         fromZigbee: [fzControl4Response, fzControl4Identity],
         toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect, tzControl4VerifySlot],
-        meta: {disableDefaultResponse: true},
+        meta: {
+            disableDefaultResponse: true,
+            // Z2M offers every light without color as "brightness", so turn
+            // the slider off for on/off-only models.
+            overrideHaDiscoveryPayload: (payload: KeyValueAny) => {
+                if (payload.supported_color_modes && c4.C4_ONOFF_MODELS.includes(payload.device?.model_id)) {
+                    payload.brightness = false;
+                    delete payload.brightness_scale;
+                    payload.supported_color_modes = ["onoff"];
+                }
+            },
+        },
         // Arm the self-heal probe campaign for quiet assumed-keypads at
         // startup (the light() extend adds no onEvent).
         onEvent: (event) => {

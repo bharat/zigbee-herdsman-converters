@@ -52,6 +52,9 @@ export const C4_IDENTITY_MODELS: Record<string, string> = {
     "C4-SW120277": "Switch",
 };
 
+/** Reported models that switch their load on and off and can't dim it */
+export const C4_ONOFF_MODELS = ["C4-SW120277"];
+
 export interface C4Identity {
     model?: string;
     firmware?: string;
