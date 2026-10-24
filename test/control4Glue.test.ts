@@ -8,6 +8,7 @@
 
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {definitions} from "../src/devices/control4";
+import {prepareDefinition} from "../src/index";
 import {
     ACTION_VALUES,
     applyC4Heal,
@@ -920,6 +921,50 @@ describe("Control4 glue", () => {
             await expect(convertSet(undefined, "c4_verify_slot", "abc", meta)).rejects.toThrow("expects a slot id");
             await expect(convertSet(undefined, "c4_verify_slot", 0, meta)).rejects.toThrow("expects a slot id");
             await expect(convertSet(undefined, "c4_verify_slot", 7, meta)).rejects.toThrow("expects a slot id");
+        });
+    });
+
+    describe("C4-V-ROSW120", () => {
+        const definition = prepareDefinition(definitions[1]);
+        const tzOnOff = definition.toZigbee.find((converter) => converter.key?.includes("state"));
+
+        function endpoint(relay: number | Error) {
+            return {
+                command: vi.fn(async () => undefined),
+                read: vi.fn(() => (relay instanceof Error ? Promise.reject(relay) : Promise.resolve({onOff: relay}))),
+            };
+        }
+
+        function turnOn(ep: ReturnType<typeof endpoint>) {
+            const meta = {message: {state: "ON"}, state: {}, mapped: definition, options: {}, endpoint_name: undefined};
+            // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the tz convertSet signature
+            return tzOnOff?.convertSet?.(ep as any, "state", "ON", meta as any);
+        }
+
+        it("matches the device's own modelID and exposes a switch", () => {
+            expect(definitions[1].zigbeeModel).toEqual(["c4:control4_light:C4-V-ROSW120"]);
+            expect(definition.model).toBe("C4-V-ROSW120");
+            expect(definition.exposes).toEqual(expect.arrayContaining([expect.objectContaining({type: "switch"})]));
+            expect(definition.meta?.disableDefaultResponse).toBe(true);
+            expect(definition.configure).toBeUndefined();
+        });
+
+        it("publishes the state read back after a command", async () => {
+            const switched = endpoint(1);
+            expect(await turnOn(switched)).toEqual({state: {state: "ON"}});
+            expect(switched.command).toHaveBeenCalledWith("genOnOff", "on", {}, {disableDefaultResponse: true});
+            expect(switched.read).toHaveBeenCalledWith("genOnOff", ["onOff"]);
+
+            expect(await turnOn(endpoint(0))).toEqual({state: {state: "OFF"}});
+        });
+
+        it("keeps the optimistic state when the read-back fails", async () => {
+            expect(await turnOn(endpoint(new Error("timeout")))).toEqual({state: {state: "ON"}});
+        });
+
+        it("polls the state with a configurable interval", () => {
+            expect(definition.onEvent).toBeDefined();
+            expect(definition.options.map((option) => option.name)).toContain("state_poll_interval");
         });
     });
 
