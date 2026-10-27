@@ -729,6 +729,15 @@ describe("Control4 glue", () => {
             expect(result?.c4_response_ep).toBe(197);
         });
 
+        it("sends no genOnOff command on a press with a cached load behavior (firmware owns the load)", async () => {
+            const {device, ep1} = makeDevice("0x0E06", {c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+
+            const result = await convert("0t0001 sa c4.dmx.bp 00", device, {button_1_behavior: "toggle_load"});
+
+            expect(result?.action).toBe("button_1_press");
+            expect(ep1.command).not.toHaveBeenCalled();
+        });
+
         it("mutes c4_response for unsolicited ls telemetry (only state fields flow)", async () => {
             const {device} = makeDevice("0x0E02", {c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
 
