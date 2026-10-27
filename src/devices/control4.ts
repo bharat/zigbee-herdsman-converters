@@ -21,7 +21,7 @@ async function readLoose(ep: Zh.Endpoint, cluster: string | number, attrs: (stri
 const fzControl4Response = {
     cluster: "genPowerCfg",
     type: ["raw"],
-    convert: async (model, msg, publish, options, meta) => {
+    convert: (model, msg, publish, options, meta) => {
         let text: string;
         try {
             text = Buffer.from(msg.data).toString("ascii").trim();
@@ -65,29 +65,15 @@ const fzControl4Response = {
                 if (healState) Object.assign(result, healState);
             }
 
-            // Smart behavior on press: if the button has load-control
-            // behavior configured, send the genOnOff command to EP1 now.
-            if (event.type === "press") {
-                const behavior = meta.state?.[`button_${event.buttonId}_behavior`] as string | undefined;
-                if (behavior && behavior !== "keypad") {
-                    try {
-                        const ep1 = msg.device.getEndpoint(1);
-                        if (ep1) {
-                            const cmd =
-                                behavior === "toggle_load" ? "toggle" : behavior === "load_on" ? "on" : behavior === "load_off" ? "off" : null;
-                            if (cmd) {
-                                logger.debug(`${c4.c4DeviceLabel(msg.device)} Smart behavior: genOnOff.${cmd}`, NS);
-                                await ep1.command("genOnOff", cmd, {});
-                            }
-                        }
-                    } catch (err) {
-                        logger.warning(`${c4.c4DeviceLabel(msg.device)} Smart behavior failed: ${(err as Error).message}`, NS);
-                    }
-                }
-            }
+            // Firmware executes load behaviors (toggle/on/off) locally on
+            // press. Never mirror them with a genOnOff command from here: the
+            // cached button_N_behavior is read back from firmware, so a
+            // converter-side command can only duplicate what firmware already
+            // did, double-toggling the load and feeding back through the
+            // resulting broadcasts (bharat/homeassistant-control4-dimmers#205).
 
-            // Manual paddle presses and the smart-behavior command above never
-            // report state on their own, so schedule a debounced load read.
+            // Button and paddle presses can change the load without reporting
+            // state on their own, so schedule a debounced load read.
             c4.scheduleC4StateRead(msg.device, meta.state?.c4_device_type as string | undefined);
 
             return result;
