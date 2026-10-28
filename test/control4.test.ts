@@ -531,6 +531,71 @@ describe("Control4 protocol", () => {
         });
     });
 
+    describe("Legacy c4.dm. dialect (C4-DIM1-Z)", () => {
+        // Frames captured from a C4-DIM1-Z (manufacturer 43981) on a ZBT-2:
+        // top press ramps 0 -> 100%, bottom press ramps back to 0%.
+        it("maps a top paddle press (b0c) to paddle_up_press", () => {
+            expect(parseButtonEvent("0tdc23 sa c4.dm.b0c")).toEqual({action: "paddle_up_press", paddle: "paddle_up", type: "press"});
+        });
+
+        it("maps a bottom paddle press (b1c) to paddle_down_press", () => {
+            expect(parseButtonEvent("0tdc27 sa c4.dm.b1c")).toEqual({action: "paddle_down_press", paddle: "paddle_down", type: "press"});
+        });
+
+        it("maps a hold-to-dim start (b1b) to paddle_down_press", () => {
+            expect(parseButtonEvent("0tdc45 sa c4.dm.b1b")).toEqual({action: "paddle_down_press", paddle: "paddle_down", type: "press"});
+        });
+
+        it("leaves a hold-to-dim end (b1e) unmapped", () => {
+            expect(parseButtonEvent("0tdc48 sa c4.dm.b1e")).toBeNull();
+        });
+
+        it("parses the hold-to-dim ramp levels", () => {
+            expect(parseLoadStatus("0tdc44 sa c4.dm.t0c 62")).toEqual({level: 98});
+            expect(parseLoadStatus("0tdc49 sa c4.dm.t0c 3c")).toEqual({level: 60});
+        });
+
+        it("maps legacy click counts to paddle click actions", () => {
+            expect(parseButtonEvent("0tdc26 sa c4.dm.cc 00 01")).toEqual({
+                action: "paddle_up_click_1",
+                paddle: "paddle_up",
+                clickCount: 1,
+                type: "click",
+            });
+            expect(parseButtonEvent("0tdc2b sa c4.dm.cc 01 02")).toEqual({
+                action: "paddle_down_click_2",
+                paddle: "paddle_down",
+                clickCount: 2,
+                type: "click",
+            });
+        });
+
+        it("ignores unknown legacy wire ids", () => {
+            expect(parseButtonEvent("0t0001 sa c4.dm.b5c")).toBeNull();
+            expect(parseButtonEvent("0t0001 sa c4.dm.cc 05 01")).toBeNull();
+        });
+
+        it("does not treat legacy level frames as button events", () => {
+            expect(parseButtonEvent("0tdc24 sa c4.dm.t0c 05")).toBeNull();
+        });
+
+        it("parses legacy t0c ramp frames as load levels", () => {
+            expect(parseLoadStatus("0tdc24 sa c4.dm.t0c 05")).toEqual({level: 5});
+            expect(parseLoadStatus("0tdc25 sa c4.dm.t0c 64")).toEqual({level: 100});
+            expect(parseLoadStatus("0tdc28 sa c4.dm.t0c 5d")).toEqual({level: 93});
+            expect(parseLoadStatus("0tdc2c sa c4.dm.t0c 00")).toEqual({level: 0});
+        });
+
+        it("rejects out-of-range legacy levels", () => {
+            expect(parseLoadStatus("0t0001 sa c4.dm.t0c 65")).toBeNull();
+        });
+
+        it("does not confuse the dmx dialect with the legacy one", () => {
+            expect(parseButtonEvent("0t0001 sa c4.dmx.bp 00")).toEqual({action: "button_1_press", buttonId: 1, type: "press"});
+            expect(parseLoadStatus("0t0001 sa c4.dmx.ls 00 00 64 0078")).toEqual({level: 100});
+        });
+    });
+
     describe("parseLoadStatus", () => {
         it("parses a ramp-up frame (04 hex) to level 4", () => {
             expect(parseLoadStatus("0t0001 sa c4.dmx.ls 00 00 04 0078 0000 0000")).toEqual({level: 4});
