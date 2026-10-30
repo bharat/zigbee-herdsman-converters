@@ -8,9 +8,11 @@
 
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {definitions} from "../src/devices/control4";
+import {prepareDefinition} from "../src/index";
 import {
     ACTION_VALUES,
     applyC4Heal,
+    applyC4Identity,
     BEHAVIOR_FROM_FIRMWARE,
     C4_CONFIDENCE_ASSUMED,
     C4_CONFIDENCE_CONFIRMED,
@@ -23,6 +25,8 @@ import {
     healTypeFromEvidence,
     isC4DimNegativeResponse,
     LED_MODE_FROM_FIRMWARE,
+    parseC4Identity,
+    readC4Identity,
     readStoredSlotConfig,
     resetC4HealState,
     resolveC4PendingQuery,
@@ -932,6 +936,131 @@ describe("Control4 glue", () => {
         });
     });
 
+    describe("Device identity (profile 0xC25D)", () => {
+        // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+        type AnyFn = (...args: any[]) => any;
+        const definition = definitions[0];
+        const fzConvert = (definition.fromZigbee as unknown as [unknown, {convert: AnyFn}])[1].convert;
+        const report = {4: "5.1.1", 7: "c4:control4_light:C4-KD120"};
+
+        function convert(
+            endpointId: number,
+            device: MockDevice,
+            state: KeyValue = {},
+            deviceExposesChanged = vi.fn(),
+            data: KeyValue = report,
+        ): Promise<KeyValue | undefined> {
+            const msg = {data, endpoint: {ID: endpointId}, device, type: "attributeReport", cluster: "genPowerCfg"};
+            return fzConvert(definition, msg, vi.fn(), {}, {state, device, deviceExposesChanged});
+        }
+
+        it("parses the model out of the c4:<class>:<model> string and the firmware", () => {
+            expect(parseC4Identity(report)).toEqual({model: "C4-KD120", firmware: "5.1.1"});
+            expect(parseC4Identity({7: "C4-APD120"})).toEqual({model: "C4-APD120"});
+            expect(parseC4Identity({})).toEqual({});
+        });
+
+        it("publishes and stores model and firmware from an endpoint 2 report", async () => {
+            const {device} = makeDevice("0x0F01");
+            expect(await convert(2, device)).toEqual({c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            expect(device.meta.c4_model).toBe("C4-KD120");
+            expect(device.meta.c4_firmware).toBe("5.1.1");
+            // Shown by Zigbee2MQTT as the model (via whiteLabel) and firmware
+            expect((device as unknown as Zh.Device).modelID).toBe("C4-KD120");
+            expect((device as unknown as Zh.Device).softwareBuildID).toBe("5.1.1");
+            expect(device.save).toHaveBeenCalledTimes(1);
+        });
+
+        it("tells Zigbee2MQTT the exposes changed only when the modelID changes", async () => {
+            const {device} = makeDevice("0x0F06");
+            Object.assign(device, {modelID: "C4-Zigbee"});
+            const changed = vi.fn();
+            await convert(2, device, {}, changed, {4: "5.1.1", 7: "c4:control4_light:C4-SW120277"});
+            expect(changed).toHaveBeenCalledTimes(1);
+
+            await convert(2, device, {c4_model: "C4-SW120277", c4_firmware: "5.1.1"}, changed, {4: "5.1.1", 7: "c4:control4_light:C4-SW120277"});
+            expect(changed).toHaveBeenCalledTimes(1);
+        });
+
+        it("leaves the placeholder modelID alone for a model the definition does not list", () => {
+            const {device} = makeDevice("0x0F05");
+            Object.assign(device, {modelID: "C4-Zigbee"});
+            applyC4Identity(asDevice(device), {model: "C4-NEW999", firmware: "6.0.0"}, {});
+            expect((device as unknown as Zh.Device).modelID).toBe("C4-Zigbee");
+            expect(device.meta.c4_model).toBe("C4-NEW999");
+        });
+
+        it("publishes nothing when the repeated report has not changed", async () => {
+            const {device} = makeDevice("0x0F02", {c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            Object.assign(device, {modelID: "C4-KD120", softwareBuildID: "5.1.1"});
+            expect(await convert(2, device, {c4_model: "C4-KD120", c4_firmware: "5.1.1"})).toBeUndefined();
+            expect(device.save).not.toHaveBeenCalled();
+        });
+
+        it("ignores genPowerCfg frames from other endpoints", async () => {
+            const {device} = makeDevice("0x0F03");
+            expect(await convert(1, device)).toBeUndefined();
+            expect(applyC4Identity(asDevice(device), {}, {})).toBeUndefined();
+        });
+
+        it("reads both attributes on endpoint 2 with the identity profile and no manufacturer code", async () => {
+            const read = vi.fn(async () => report);
+            const ep2 = {ID: 2, read};
+            const device = {
+                ieeeAddr: "0x0F04",
+                meta: {},
+                save: vi.fn(),
+                getEndpoint: vi.fn(() => undefined),
+                createEndpoint: vi.fn(() => ep2),
+            };
+            expect(await readC4Identity(device as unknown as Zh.Device)).toEqual({model: "C4-KD120", firmware: "5.1.1"});
+            expect(device.createEndpoint).toHaveBeenCalledWith(2);
+            expect(read).toHaveBeenCalledWith(1, [0x0004, 0x0007], {profileId: 0xc25d, srcEndpoint: 2, timeout: 10000});
+        });
+    });
+
+    describe("On/off-only models", () => {
+        const definition = prepareDefinition(definitions[0]);
+        const exposesFor = (device: KeyValue) =>
+            (definition.exposes as unknown as (d: KeyValue, o: KeyValue) => {type: string; features?: {name: string}[]}[])(device, {});
+        const lightFeatures = (device: KeyValue) =>
+            exposesFor(device)
+                .find((expose) => expose.type === "light")
+                ?.features?.map((feature) => feature.name);
+        const discovery = (modelId: string): KeyValue => ({
+            brightness: true,
+            brightness_scale: 254,
+            supported_color_modes: ["brightness"],
+            device: {model_id: modelId},
+        });
+
+        it("exposes a light without brightness for a C4-SW120277", () => {
+            expect(lightFeatures({modelID: "C4-SW120277"})).toEqual(["state"]);
+        });
+
+        it("keeps brightness for dimmers, unidentified devices and the docs", () => {
+            for (const device of [{modelID: "C4-APD120"}, {modelID: "C4-Zigbee"}, {isDummyDevice: true}]) {
+                expect(lightFeatures(device)).toEqual(["state", "brightness"]);
+            }
+        });
+
+        it("turns the Home Assistant brightness slider off for a C4-SW120277", () => {
+            const payload = discovery("C4-SW120277");
+            definition.meta?.overrideHaDiscoveryPayload?.(payload);
+            expect(payload).toEqual({brightness: false, supported_color_modes: ["onoff"], device: {model_id: "C4-SW120277"}});
+        });
+
+        it("leaves dimmer lights and other entities alone", () => {
+            const dimmer = discovery("C4-APD120");
+            definition.meta?.overrideHaDiscoveryPayload?.(dimmer);
+            expect(dimmer).toEqual(discovery("C4-APD120"));
+
+            const sensor: KeyValue = {device: {model_id: "C4-SW120277"}, state_class: "measurement"};
+            definition.meta?.overrideHaDiscoveryPayload?.(sensor);
+            expect(sensor).toEqual({device: {model_id: "C4-SW120277"}, state_class: "measurement"});
+        });
+    });
+
     describe("Frozen MQTT contract", () => {
         const definition = definitions[0];
 
@@ -987,6 +1116,14 @@ describe("Control4 glue", () => {
         it("definition model and vendor are stable", () => {
             expect(definition.model).toBe("C4-Zigbee");
             expect(definition.vendor).toBe("Control4");
+        });
+
+        it("whiteLabels every identity model and lists it as a zigbeeModel", () => {
+            const models = ["C4-APD120", "C4-KD120", "C4-KC120277", "C4-SW120277"];
+            expect((definition.whiteLabel ?? []).map((w) => w.model)).toEqual(models);
+            for (const model of models) {
+                expect(definition.zigbeeModel).toContain(model);
+            }
         });
 
         it("fingerprint matches on the Control4 manufacturer ID", () => {

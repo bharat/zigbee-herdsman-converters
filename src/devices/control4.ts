@@ -2,7 +2,8 @@ import * as c4 from "../lib/control4";
 import * as exposes from "../lib/exposes";
 import {logger} from "../lib/logger";
 import * as m from "../lib/modernExtend";
-import type {DefinitionWithExtend, Fz, KeyValue, Tz, Zh} from "../lib/types";
+import type {DefinitionWithExtend, Expose, Fz, KeyValue, KeyValueAny, ModernExtend, Tz, Zh} from "../lib/types";
+import {isDummyDevice} from "../lib/utils";
 
 const e = exposes.presets;
 const NS = "zhc:control4";
@@ -13,6 +14,18 @@ const NS = "zhc:control4";
 async function readLoose(ep: Zh.Endpoint, cluster: string | number, attrs: (string | number)[]): Promise<KeyValue> {
     const read = ep.read as unknown as (c: string | number, a: (string | number)[], o?: {timeout?: number}) => Promise<KeyValue | undefined>;
     return (await read.call(ep, cluster, attrs, {timeout: 10000})) ?? {};
+}
+
+// On/off-only models (by reported identity) get a light without brightness;
+// everything else, including devices whose identity isn't known yet, dims.
+function c4Light(): ModernExtend {
+    const light = m.light({configureReporting: false});
+    const [dimmable, ...rest] = light.exposes as Expose[];
+    const onOff = e.light();
+    return {
+        ...light,
+        exposes: [(device) => [!isDummyDevice(device) && c4.C4_ONOFF_MODELS.includes(device.modelID) ? onOff : dimmable, ...rest]],
+    };
 }
 
 // C4 responses and telemetry arrive as raw ASCII from endpoint 197, profile
@@ -100,6 +113,22 @@ const fzControl4Response = {
         return result;
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["raw"]>;
+
+// Model and firmware arrive on the identity profile (0xC25D) as standard ZCL
+// frames from endpoint 2, cluster 1: an attribute report about once a minute,
+// or the answer to readC4Identity. Published only when they change.
+const fzControl4Identity = {
+    cluster: "genPowerCfg",
+    type: ["attributeReport", "readResponse"],
+    convert: (model, msg, publish, options, meta) => {
+        if (msg.endpoint?.ID !== c4.C4_IDENTITY_ENDPOINT) return;
+        const modelID = msg.device.modelID;
+        const result = c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
+        // The new model can change the exposes (see c4Light).
+        if (msg.device.modelID !== modelID) meta.deviceExposesChanged();
+        return result;
+    },
+} satisfies Fz.Converter<"genPowerCfg", undefined, ["attributeReport", "readResponse"]>;
 
 // Set LED colors, single ({"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}})
 // or batch ({"c4_led": {"top_on": "ffffff", "bottom_off": "0000ff", ...}}).
@@ -355,17 +384,35 @@ export const definitions: DefinitionWithExtend[] = [
             "C4-KD277", // Keypad dimmer 277V
             "C4-FPD120", // Forward phase dimmer 120V
             "C4-KC120277", // Configurable keypad 120V/277V
+            "C4-SW120277", // Switch 120V/277V (modelID once its identity is read)
             "LDZ-102", // Legacy dimmer model
         ],
         fingerprint: [{manufacturerID: 43981}],
         model: "C4-Zigbee",
         vendor: "Control4",
         description: "Zigbee dimmer/keypad (C4-APD120, C4-KD120, C4-KC120277)",
-        extend: [m.light({configureReporting: false})],
+        // Shown once the device's reported identity has replaced the placeholder modelID.
+        whiteLabel: Object.entries(c4.C4_IDENTITY_MODELS).map(([model, description]) => ({
+            model,
+            description,
+            fingerprint: [{modelID: model}],
+        })),
+        extend: [c4Light()],
         exposes: [e.action([...c4.ACTION_VALUES])],
-        fromZigbee: [fzControl4Response],
+        fromZigbee: [fzControl4Response, fzControl4Identity],
         toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect, tzControl4VerifySlot],
-        meta: {disableDefaultResponse: true},
+        meta: {
+            disableDefaultResponse: true,
+            // Z2M offers every light without color as "brightness", so turn
+            // the slider off for on/off-only models.
+            overrideHaDiscoveryPayload: (payload: KeyValueAny) => {
+                if (payload.supported_color_modes && c4.C4_ONOFF_MODELS.includes(payload.device?.model_id)) {
+                    payload.brightness = false;
+                    delete payload.brightness_scale;
+                    payload.supported_color_modes = ["onoff"];
+                }
+            },
+        },
         // Arm the self-heal probe campaign for quiet assumed-keypads at
         // startup (the light() extend adds no onEvent).
         onEvent: (event) => {
@@ -395,6 +442,14 @@ export const definitions: DefinitionWithExtend[] = [
             } catch (err) {
                 logger.warning(`Auto-detection failed: ${(err as Error).message}`, NS);
                 logger.warning(`Run {"c4_detect": true} to detect device type and read LED colors.`, NS);
+            }
+
+            // The answer also flows through fzControl4Identity, which publishes it.
+            try {
+                const identity = await c4.readC4Identity(device);
+                logger.info(`Identity: ${identity.model ?? "?"} firmware ${identity.firmware ?? "?"}`, NS);
+            } catch (err) {
+                logger.info(`Identity read failed (the periodic report will fill it in): ${(err as Error).message}`, NS);
             }
 
             logger.info(`Device ${device.ieeeAddr} configured.`, NS);
