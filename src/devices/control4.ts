@@ -361,7 +361,10 @@ export const definitions: DefinitionWithExtend[] = [
         model: "C4-Zigbee",
         vendor: "Control4",
         description: "Zigbee dimmer/keypad (C4-APD120, C4-KD120, C4-KC120277)",
-        extend: [m.light({configureReporting: false})],
+        // No effect or power-on behavior selects: no Control4 device has
+        // reported a power-on behavior, and the trigger effect isn't known to
+        // do anything on them.
+        extend: [m.light({configureReporting: false, effect: false, powerOnBehavior: false})],
         exposes: [e.action([...c4.ACTION_VALUES])],
         fromZigbee: [fzControl4Response],
         toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect, tzControl4VerifySlot],

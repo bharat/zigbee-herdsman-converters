@@ -8,6 +8,7 @@
 
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {definitions} from "../src/devices/control4";
+import {prepareDefinition} from "../src/index";
 import {
     ACTION_VALUES,
     applyC4Heal,
@@ -982,6 +983,12 @@ describe("Control4 glue", () => {
                 "01": "follow_load",
                 "02": "push_release",
             });
+        });
+
+        it("exposes no effect or power-on behavior select", () => {
+            const names = (prepareDefinition(definition).exposes as {name?: string}[]).map((expose) => expose.name);
+            expect(names).not.toContain("effect");
+            expect(names).not.toContain("power_on_behavior");
         });
 
         it("definition model and vendor are stable", () => {
