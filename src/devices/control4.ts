@@ -1,3 +1,5 @@
+import * as fz from "../converters/fromZigbee";
+import * as tz from "../converters/toZigbee";
 import * as c4 from "../lib/control4";
 import * as exposes from "../lib/exposes";
 import {logger} from "../lib/logger";
@@ -5,6 +7,7 @@ import * as m from "../lib/modernExtend";
 import type {DefinitionWithExtend, Fz, KeyValue, Tz, Zh} from "../lib/types";
 
 const e = exposes.presets;
+const ea = exposes.access;
 const NS = "zhc:control4";
 
 // Read arbitrary cluster attributes through a loosened Endpoint.read signature
@@ -345,6 +348,23 @@ const tzControl4VerifySlot = {
     },
 } satisfies Tz.Converter;
 
+// The C4-V-ROSW120 never confirms a command (no default response, no
+// reports), so read the state back to publish what the relay actually did.
+// If the read fails, the optimistic state stays until the next poll.
+const tzRosOnOff = {
+    key: ["state"],
+    convertSet: async (entity, key, value, meta) => {
+        const result = await tz.on_off.convertSet(entity, key, value, meta);
+        try {
+            const read = await entity.read("genOnOff", ["onOff"]);
+            return {state: {state: read.onOff ? "ON" : "OFF"}};
+        } catch {
+            return result;
+        }
+    },
+    convertGet: tz.on_off.convertGet,
+} satisfies Tz.Converter;
+
 export const definitions: DefinitionWithExtend[] = [
     {
         zigbeeModel: [
@@ -399,5 +419,34 @@ export const definitions: DefinitionWithExtend[] = [
 
             logger.info(`Device ${device.ieeeAddr} configured.`, NS);
         },
+    },
+    {
+        // Switches its load through genOnOff on endpoint 1 even though it
+        // doesn't list the cluster. It never reports on/off, never sends a
+        // default response and refuses binds, so there's nothing to
+        // configure: commands are read back and the state is polled to catch
+        // the physical button (bharat/zigbee2mqtt-control4#2).
+        zigbeeModel: ["c4:control4_light:C4-V-ROSW120"],
+        model: "C4-V-ROSW120",
+        vendor: "Control4",
+        description: "On/off relay",
+        extend: [
+            {exposes: [e.switch()], fromZigbee: [fz.on_off], toZigbee: [tzRosOnOff], isModernExtend: true},
+            m.poll({
+                key: "state",
+                defaultIntervalSeconds: 600,
+                option: e
+                    .numeric("state_poll_interval", ea.SET)
+                    .withValueMin(-1)
+                    .withUnit("s")
+                    .withDescription(
+                        "How often to read the on/off state, since the device never reports it. Default 600 (10 minutes); -1 disables polling.",
+                    ),
+                poll: async (device) => {
+                    await device.getEndpoint(1).read("genOnOff", ["onOff"]);
+                },
+            }),
+        ],
+        meta: {disableDefaultResponse: true},
     },
 ];
