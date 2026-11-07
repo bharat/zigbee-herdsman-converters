@@ -894,6 +894,31 @@ describe("Control4 glue", () => {
             await expect(readStoredSlotConfig(asDevice(device), 7)).rejects.toThrow("Invalid slot id");
         });
 
+        it("c4_cmd publishes the read-back of a dimming write only", async () => {
+            const convertCmd = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_cmd"))?.convertSet as AnyFn;
+            const {device} = makeRespondingDevice("0x0F06", (cmd) => (cmd === "c4.dm.tv 00 02" ? "000 c4.dm.tv 01f4" : null));
+            const publish = vi.fn();
+            const meta = {device: asDevice(device), publish, state: {}, message: {}};
+
+            await convertCmd(undefined, "c4_cmd", "c4.dm.tv 00 02 000001f4", meta);
+            expect(publish).toHaveBeenCalledExactlyOnceWith({c4_tv_02: 500});
+
+            publish.mockClear();
+            await convertCmd(undefined, "c4_cmd", "c4.dmx.led 01 03 ff0000", meta);
+            expect(publish).not.toHaveBeenCalled();
+        });
+
+        it("c4_read_dimming publishes every answered parameter", async () => {
+            const convertRead = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_read_dimming"))?.convertSet as AnyFn;
+            const {device} = makeRespondingDevice("0x0F07", () => "000 c4.dm.tv 0064");
+            const publish = vi.fn();
+
+            await convertRead(undefined, "c4_read_dimming", true, {device: asDevice(device), publish, state: {}, message: {}});
+
+            expect(Object.keys(publish.mock.calls[0][0])).toHaveLength(9);
+            expect(publish.mock.calls[0][0].c4_tv_0a).toBe(100);
+        });
+
         it("tz publishes observed values with the marker, then clears the marker", async () => {
             const {device} = makeRespondingDevice("0x0F05", (cmd) => slot3Answers[cmd] ?? null);
             const publish = vi.fn();

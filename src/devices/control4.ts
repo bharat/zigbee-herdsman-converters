@@ -197,6 +197,11 @@ const tzControl4Cmd = {
         }
 
         const sent = await c4.sendC4(meta.device, value);
+
+        // Keep Z2M's cached dimming table right whichever way a write arrives.
+        const dimmingParam = c4.parseDimmingWriteParam(value);
+        if (dimmingParam) meta.publish(await c4.readDimmingParam(meta.device, dimmingParam));
+
         return {state: {c4_last_cmd: sent}};
     },
 } satisfies Tz.Converter;

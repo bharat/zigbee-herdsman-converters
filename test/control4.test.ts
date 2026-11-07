@@ -33,6 +33,7 @@ import {
     normalizeColorHex,
     parseButtonEvent,
     parseDimmingResponse,
+    parseDimmingWriteParam,
     parseDimResponse,
     parseLedColorResponse,
     parseLoadStatus,
@@ -663,6 +664,14 @@ describe("Control4 protocol", () => {
         it("ignores short frames and other telemetry", () => {
             expect(parseLoadTelemetry("0t0001 sa c4.dmx.ls 00 00 04 0078 0000 0000")).toBeNull();
             expect(parseLoadTelemetry("0t0001 sa c4.dmx.bp 01")).toBeNull();
+        });
+    });
+
+    describe("parseDimmingWriteParam", () => {
+        it("finds the parameter in a write and ignores anything else", () => {
+            expect(parseDimmingWriteParam("c4.dm.tv 00 0A 000001f4")).toBe("0a");
+            expect(parseDimmingWriteParam("c4.dm.tv 00 02")).toBeNull();
+            expect(parseDimmingWriteParam("c4.dmx.led 01 03 ff0000")).toBeNull();
         });
     });
 

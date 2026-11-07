@@ -465,10 +465,21 @@ export function parseDimmingResponse(responseText?: string | null): number | nul
 export async function readDimmingTable(device: Zh.Device): Promise<KeyValue> {
     const state: KeyValue = {};
     for (const param of C4_DIMMING_PARAMS) {
-        const value = parseDimmingResponse(await queryC4WithResponse(device, `c4.dm.tv 00 ${param}`, 2000));
-        if (value !== null) state[`c4_tv_${param}`] = value;
+        Object.assign(state, await readDimmingParam(device, param));
     }
     return state;
+}
+
+/** Read one dimming table parameter as its c4_tv_<param> state key; empty when there's no valid reply. */
+export async function readDimmingParam(device: Zh.Device, param: string): Promise<KeyValue> {
+    const value = parseDimmingResponse(await queryC4WithResponse(device, `c4.dm.tv 00 ${param}`, 2000));
+    return value === null ? {} : {[`c4_tv_${param}`]: value};
+}
+
+/** The parameter a raw command writes in the dimming table, "c4.dm.tv 00 02 000001f4" → "02", or null. */
+export function parseDimmingWriteParam(command: string): string | null {
+    const match = command.match(/^c4\.dm\.tv 00 ([0-9a-fA-F]{2}) [0-9a-fA-F]+$/);
+    return match ? match[1].toLowerCase() : null;
 }
 
 export type C4DeviceType = "dimmer" | "keypaddim" | "keypad";
