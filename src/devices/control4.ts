@@ -445,7 +445,7 @@ export const definitions: DefinitionWithExtend[] = [
         zigbeeModel: ["c4:control4_light:C4-V-ROSW120"],
         model: "C4-V-ROSW120",
         vendor: "Control4",
-        description: "On/off relay",
+        description: "Outlet",
         extend: [
             {
                 exposes: [e.switch(), e.action(c4.ACTION_VALUES.filter((action) => action.startsWith("button_1_")))],
