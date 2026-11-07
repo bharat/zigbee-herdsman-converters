@@ -7,7 +7,6 @@ import * as m from "../lib/modernExtend";
 import type {DefinitionWithExtend, Fz, KeyValue, Tz, Zh} from "../lib/types";
 
 const e = exposes.presets;
-const ea = exposes.access;
 const NS = "zhc:control4";
 
 // Read arbitrary cluster attributes through a loosened Endpoint.read signature
@@ -348,9 +347,9 @@ const tzControl4VerifySlot = {
     },
 } satisfies Tz.Converter;
 
-// The C4-V-ROSW120 never confirms a command (no default response, no
+// The C4-V-ROSW120 never confirms a command (no default response, no ZCL
 // reports), so read the state back to publish what the relay actually did.
-// If the read fails, the optimistic state stays until the next poll.
+// If the read fails, the optimistic state stays until the next button press.
 const tzRosOnOff = {
     key: ["state"],
     convertSet: async (entity, key, value, meta) => {
@@ -425,30 +424,24 @@ export const definitions: DefinitionWithExtend[] = [
     },
     {
         // Switches its load through genOnOff on endpoint 1 even though it
-        // doesn't list the cluster. It never reports on/off, never sends a
-        // default response and refuses binds, so there's nothing to
-        // configure: commands are read back and the state is polled to catch
-        // the physical button (bharat/zigbee2mqtt-control4#2).
+        // doesn't list the cluster. It never sends ZCL reports or a default
+        // response and refuses binds, so there's nothing to configure. Its
+        // button does speak the C4 text protocol on endpoint 197: a press
+        // sends c4.dmx.bp/sc/cc 00 (button_1_* actions) plus c4.dmx.tc with
+        // the new level, and the press schedules the same genOnOff read the
+        // dimmers use, so the state follows the physical button without
+        // polling (bharat/zigbee2mqtt-control4#2).
         zigbeeModel: ["c4:control4_light:C4-V-ROSW120"],
         model: "C4-V-ROSW120",
         vendor: "Control4",
         description: "On/off relay",
         extend: [
-            {exposes: [e.switch()], fromZigbee: [fz.on_off], toZigbee: [tzRosOnOff], isModernExtend: true},
-            m.poll({
-                key: "state",
-                defaultIntervalSeconds: 600,
-                option: e
-                    .numeric("state_poll_interval", ea.SET)
-                    .withValueMin(-1)
-                    .withUnit("s")
-                    .withDescription(
-                        "How often to read the on/off state, since the device never reports it. Default 600 (10 minutes); -1 disables polling.",
-                    ),
-                poll: async (device) => {
-                    await device.getEndpoint(1).read("genOnOff", ["onOff"]);
-                },
-            }),
+            {
+                exposes: [e.switch(), e.action(c4.ACTION_VALUES.filter((action) => action.startsWith("button_1_")))],
+                fromZigbee: [fz.on_off, fzControl4Response],
+                toZigbee: [tzRosOnOff, tzControl4Cmd, tzControl4Query],
+                isModernExtend: true,
+            },
         ],
         meta: {disableDefaultResponse: true},
     },

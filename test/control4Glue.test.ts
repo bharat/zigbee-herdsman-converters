@@ -971,9 +971,34 @@ describe("Control4 glue", () => {
             expect(await turnOn(endpoint(new Error("timeout")))).toEqual({state: {state: "ON"}});
         });
 
-        it("polls the state with a configurable interval", () => {
-            expect(definition.onEvent).toBeDefined();
-            expect(definition.options.map((option) => option.name)).toContain("state_poll_interval");
+        it("doesn't poll: the button reports through the C4 text protocol", () => {
+            expect(definition.onEvent).toBeUndefined();
+            expect(definition.options.map((option) => option.name)).not.toContain("state_poll_interval");
+        });
+
+        it("exposes the button's actions and accepts raw C4 commands", () => {
+            const action = definition.exposes.find((expose) => expose.name === "action") as {values?: string[]} | undefined;
+            expect(action?.values).toEqual(ACTION_VALUES.filter((value) => value.startsWith("button_1_")));
+            const keys = definition.toZigbee.flatMap((converter) => converter.key ?? []);
+            expect(keys).toEqual(expect.arrayContaining(["state", "c4_cmd", "c4_query"]));
+        });
+
+        it("turns a physical button press into a button_1 action", async () => {
+            vi.useFakeTimers();
+            try {
+                // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+                const handler = definition.fromZigbee.find((converter) => converter.cluster === "genPowerCfg") as any;
+                const {device} = makeDevice("0x0E40", {});
+                const msg = {data: Buffer.from("0t78cd sa c4.dmx.bp 00", "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+                const result = await handler.convert(definition, msg, vi.fn(), {}, {state: {}, device});
+                expect(result?.action).toBe("button_1_press");
+                // A press never retypes the outlet or arms the keypad probe campaign.
+                expect(result?.c4_device_type).toBeUndefined();
+            } finally {
+                resetC4HealState();
+                vi.runOnlyPendingTimers();
+                vi.useRealTimers();
+            }
         });
     });
 
