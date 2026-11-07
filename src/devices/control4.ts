@@ -105,7 +105,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
                 delete result.c4_response;
                 delete result.c4_response_ep;
 
-                c4.scheduleC4LoadStatePublish(msg.device, loadStatus.level, publish);
+                c4.scheduleC4LoadStatePublish(msg.device, loadStatus.level, publish, c4.parseLoadTelemetry(text));
                 return result;
             }
 
@@ -390,6 +390,16 @@ const tzRosOnOff = {
     convertGet: tz.on_off.convertGet,
 } satisfies Tz.Converter;
 
+// Read the whole dimming table: {"c4_read_dimming": ""} publishes c4_tv_<param>.
+const tzControl4ReadDimming = {
+    key: ["c4_read_dimming"],
+    convertSet: async (entity, key, value, meta) => {
+        if (!meta.device) throw new Error("c4_read_dimming requires a device");
+        // Publish directly, as c4_verify_slot does: Z2M doesn't publish state returned from this command.
+        meta.publish(await c4.readDimmingTable(meta.device));
+    },
+} satisfies Tz.Converter;
+
 export const definitions: DefinitionWithExtend[] = [
     {
         zigbeeModel: [
@@ -419,7 +429,16 @@ export const definitions: DefinitionWithExtend[] = [
         extend: [m.light({configureReporting: false, effect: false, powerOnBehavior: false})],
         exposes: [e.action([...c4.ACTION_VALUES])],
         fromZigbee: [fzControl4Response, fzControl4Identity],
-        toZigbee: [tzControl4Led, tzControl4Cmd, tzControl4Query, tzControl4ZclRead, tzControl4Probe, tzControl4Detect, tzControl4VerifySlot],
+        toZigbee: [
+            tzControl4Led,
+            tzControl4Cmd,
+            tzControl4Query,
+            tzControl4ZclRead,
+            tzControl4Probe,
+            tzControl4Detect,
+            tzControl4VerifySlot,
+            tzControl4ReadDimming,
+        ],
         meta: {disableDefaultResponse: true},
         // Arm the self-heal probe campaign for quiet assumed-keypads at
         // startup (the light() extend adds no onEvent).
