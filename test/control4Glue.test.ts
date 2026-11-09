@@ -933,6 +933,75 @@ describe("Control4 glue", () => {
         });
     });
 
+    describe("C4-V-ROSW120", () => {
+        const definition = prepareDefinition(definitions[1]);
+        const tzOnOff = definition.toZigbee.find((converter) => converter.key?.includes("state"));
+
+        function endpoint(relay: number | Error) {
+            return {
+                command: vi.fn(async () => undefined),
+                read: vi.fn(() => (relay instanceof Error ? Promise.reject(relay) : Promise.resolve({onOff: relay}))),
+            };
+        }
+
+        function turnOn(ep: ReturnType<typeof endpoint>) {
+            const meta = {message: {state: "ON"}, state: {}, mapped: definition, options: {}, endpoint_name: undefined};
+            // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the tz convertSet signature
+            return tzOnOff?.convertSet?.(ep as any, "state", "ON", meta as any);
+        }
+
+        it("matches the device's own modelID and exposes a switch", () => {
+            expect(definitions[1].zigbeeModel).toEqual(["c4:control4_light:C4-V-ROSW120"]);
+            expect(definition.model).toBe("C4-V-ROSW120");
+            expect(definition.exposes).toEqual(expect.arrayContaining([expect.objectContaining({type: "switch"})]));
+            expect(definition.meta?.disableDefaultResponse).toBe(true);
+            expect(definition.configure).toBeUndefined();
+        });
+
+        it("publishes the state read back after a command", async () => {
+            const switched = endpoint(1);
+            expect(await turnOn(switched)).toEqual({state: {state: "ON"}});
+            expect(switched.command).toHaveBeenCalledWith("genOnOff", "on", {}, {disableDefaultResponse: true});
+            expect(switched.read).toHaveBeenCalledWith("genOnOff", ["onOff"]);
+
+            expect(await turnOn(endpoint(0))).toEqual({state: {state: "OFF"}});
+        });
+
+        it("keeps the optimistic state when the read-back fails", async () => {
+            expect(await turnOn(endpoint(new Error("timeout")))).toEqual({state: {state: "ON"}});
+        });
+
+        it("doesn't poll: the button reports through the C4 text protocol", () => {
+            expect(definition.onEvent).toBeUndefined();
+            expect(definition.options.map((option) => option.name)).not.toContain("state_poll_interval");
+        });
+
+        it("exposes the button's actions and accepts raw C4 commands", () => {
+            const action = definition.exposes.find((expose) => expose.name === "action") as {values?: string[]} | undefined;
+            expect(action?.values).toEqual(ACTION_VALUES.filter((value) => value.startsWith("button_1_")));
+            const keys = definition.toZigbee.flatMap((converter) => converter.key ?? []);
+            expect(keys).toEqual(expect.arrayContaining(["state", "c4_cmd", "c4_query"]));
+        });
+
+        it("turns a physical button press into a button_1 action", async () => {
+            vi.useFakeTimers();
+            try {
+                // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+                const handler = definition.fromZigbee.find((converter) => converter.cluster === "genPowerCfg") as any;
+                const {device} = makeDevice("0x0E40", {});
+                const msg = {data: Buffer.from("0t78cd sa c4.dmx.bp 00", "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+                const result = await handler.convert(definition, msg, vi.fn(), {}, {state: {}, device});
+                expect(result?.action).toBe("button_1_press");
+                // A press never retypes the outlet or arms the keypad probe campaign.
+                expect(result?.c4_device_type).toBeUndefined();
+            } finally {
+                resetC4HealState();
+                vi.runOnlyPendingTimers();
+                vi.useRealTimers();
+            }
+        });
+    });
+
     describe("Frozen MQTT contract", () => {
         const definition = definitions[0];
 

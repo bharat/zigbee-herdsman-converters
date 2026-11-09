@@ -1,3 +1,5 @@
+import * as fz from "../converters/fromZigbee";
+import * as tz from "../converters/toZigbee";
 import * as c4 from "../lib/control4";
 import * as exposes from "../lib/exposes";
 import {logger} from "../lib/logger";
@@ -345,6 +347,23 @@ const tzControl4VerifySlot = {
     },
 } satisfies Tz.Converter;
 
+// The C4-V-ROSW120 never confirms a command (no default response, no ZCL
+// reports), so read the state back to publish what the relay actually did.
+// If the read fails, the optimistic state stays until the next button press.
+const tzRosOnOff = {
+    key: ["state"],
+    convertSet: async (entity, key, value, meta) => {
+        const result = await tz.on_off.convertSet(entity, key, value, meta);
+        try {
+            const read = await entity.read("genOnOff", ["onOff"]);
+            return {state: {state: read.onOff ? "ON" : "OFF"}};
+        } catch {
+            return result;
+        }
+    },
+    convertGet: tz.on_off.convertGet,
+} satisfies Tz.Converter;
+
 export const definitions: DefinitionWithExtend[] = [
     {
         zigbeeModel: [
@@ -402,5 +421,28 @@ export const definitions: DefinitionWithExtend[] = [
 
             logger.info(`Device ${device.ieeeAddr} configured.`, NS);
         },
+    },
+    {
+        // Switches its load through genOnOff on endpoint 1 even though it
+        // doesn't list the cluster. It never sends ZCL reports or a default
+        // response and refuses binds, so there's nothing to configure. Its
+        // button does speak the C4 text protocol on endpoint 197: a press
+        // sends c4.dmx.bp/sc/cc 00 (button_1_* actions) plus c4.dmx.tc with
+        // the new level, and the press schedules the same genOnOff read the
+        // dimmers use, so the state follows the physical button without
+        // polling (bharat/zigbee2mqtt-control4#2).
+        zigbeeModel: ["c4:control4_light:C4-V-ROSW120"],
+        model: "C4-V-ROSW120",
+        vendor: "Control4",
+        description: "Outlet",
+        extend: [
+            {
+                exposes: [e.switch(), e.action(c4.ACTION_VALUES.filter((action) => action.startsWith("button_1_")))],
+                fromZigbee: [fz.on_off, fzControl4Response],
+                toZigbee: [tzRosOnOff, tzControl4Cmd, tzControl4Query],
+                isModernExtend: true,
+            },
+        ],
+        meta: {disableDefaultResponse: true},
     },
 ];
