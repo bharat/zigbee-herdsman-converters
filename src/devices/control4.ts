@@ -20,88 +20,102 @@ async function readLoose(ep: Zh.Endpoint, cluster: string | number, attrs: (stri
 // C4 responses and telemetry arrive as raw ASCII from endpoint 197, profile
 // 0xC25C, cluster 1 (which ZCL resolves to genPowerCfg), so herdsman fires a
 // "raw" event captured here.
-const fzControl4Response = {
-    cluster: "genPowerCfg",
-    type: ["raw"],
-    convert: (model, msg, publish, options, meta) => {
-        let text: string;
-        try {
-            text = Buffer.from(msg.data).toString("ascii").trim();
-        } catch {
-            return; // Not ASCII data: ignore
-        }
-        if (!text) return;
+// `heal` runs the device-type self-heal (probe campaign and passive evidence);
+// `legacyDialect` accepts the pre-dmx `c4.dm.*` frames. Devices whose type is
+// fixed by their model, like the C4-V-ROSW120 outlet, turn both off: they must
+// never be retyped, and their firmware answers some `c4.dm.*` commands, so an
+// unsolicited legacy frame from one must not be read as a paddle or load level.
+const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =>
+    ({
+        cluster: "genPowerCfg",
+        type: ["raw"],
+        convert: (model, msg, publish, options, meta) => {
+            let text: string;
+            try {
+                text = Buffer.from(msg.data).toString("ascii").trim();
+            } catch {
+                return; // Not ASCII data: ignore
+            }
+            if (!text) return;
 
-        const epId = msg.endpoint?.ID ?? "?";
-        logger.debug(`Received EP ${epId}: ${text}`, NS);
+            const epId = msg.endpoint?.ID ?? "?";
+            logger.debug(`Received EP ${epId}: ${text}`, NS);
 
-        const respSeq = c4.parseResponseSeq(text);
-        if (respSeq && c4.resolveC4PendingQuery(respSeq, text)) {
-            logger.debug(`Resolved pending query seq ${respSeq}`, NS);
-        }
+            const respSeq = c4.parseResponseSeq(text);
+            if (respSeq && c4.resolveC4PendingQuery(respSeq, text)) {
+                logger.debug(`Resolved pending query seq ${respSeq}`, NS);
+            }
 
-        const result: KeyValue = {c4_response: text, c4_response_ep: epId};
+            const result: KeyValue = {c4_response: text, c4_response_ep: epId};
 
-        const currentType = (meta.state?.c4_device_type as string | undefined) ?? (msg.device?.meta.c4_device_type as string | undefined);
+            if (!opts.legacyDialect && LEGACY_DM_FRAME.test(text)) return result;
 
-        // Arm the self-heal campaign on the first message from an assumed
-        // keypad (idempotent; no-op for load types and confirmed keypads).
-        c4.scheduleC4ProbeCampaign(msg.device, currentType, publish);
+            const currentType = (meta.state?.c4_device_type as string | undefined) ?? (msg.device?.meta.c4_device_type as string | undefined);
 
-        // Passive self-heal: any dim answer is authoritative load evidence.
-        const dimAnswerCode = c4.parseDimResponse(text);
-        if (dimAnswerCode) {
-            const healState = c4.applyC4Heal(msg.device, currentType, {dimCode: dimAnswerCode});
-            if (healState) Object.assign(result, healState);
-        }
+            // Arm the self-heal campaign on the first message from an assumed
+            // keypad (idempotent; no-op for load types and confirmed keypads).
+            if (opts.heal) c4.scheduleC4ProbeCampaign(msg.device, currentType, publish);
 
-        const event = c4.parseButtonEvent(text);
-        if (event) {
-            result.action = event.action;
-            logger.debug(`${c4.c4DeviceLabel(msg.device)} ${event.type}: ${event.action}`, NS);
-
-            // Passive self-heal: a load paddle half only exists on
-            // load-bearing hardware.
-            if (event.paddle) {
-                const healState = c4.applyC4Heal(msg.device, currentType, {paddle: true});
+            // Passive self-heal: any dim answer is authoritative load evidence.
+            const dimAnswerCode = c4.parseDimResponse(text);
+            if (opts.heal && dimAnswerCode) {
+                const healState = c4.applyC4Heal(msg.device, currentType, {dimCode: dimAnswerCode});
                 if (healState) Object.assign(result, healState);
             }
 
-            // Firmware executes load behaviors (toggle/on/off) locally on
-            // press. Never mirror them with a genOnOff command from here: the
-            // cached button_N_behavior is read back from firmware, so a
-            // converter-side command can only duplicate what firmware already
-            // did, double-toggling the load and feeding back through the
-            // resulting broadcasts (bharat/homeassistant-control4-dimmers#205).
+            const event = c4.parseButtonEvent(text);
+            if (event) {
+                result.action = event.action;
+                logger.debug(`${c4.c4DeviceLabel(msg.device)} ${event.type}: ${event.action}`, NS);
 
-            // Button and paddle presses can change the load without reporting
-            // state on their own, so schedule a debounced load read.
-            c4.scheduleC4StateRead(msg.device, meta.state?.c4_device_type as string | undefined);
+                // Passive self-heal: a load paddle half only exists on
+                // load-bearing hardware.
+                if (opts.heal && event.paddle) {
+                    const healState = c4.applyC4Heal(msg.device, currentType, {paddle: true});
+                    if (healState) Object.assign(result, healState);
+                }
+
+                // Firmware executes load behaviors (toggle/on/off) locally on
+                // press. Never mirror them with a genOnOff command from here: the
+                // cached button_N_behavior is read back from firmware, so a
+                // converter-side command can only duplicate what firmware already
+                // did, double-toggling the load and feeding back through the
+                // resulting broadcasts (bharat/homeassistant-control4-dimmers#205).
+
+                // Button and paddle presses can change the load without reporting
+                // state on their own, so schedule a debounced load read.
+                c4.scheduleC4StateRead(msg.device, meta.state?.c4_device_type as string | undefined);
+
+                return result;
+            }
+
+            const loadStatus = c4.parseLoadStatus(text);
+            if (loadStatus) {
+                logger.debug(`${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
+
+                // Passive self-heal: ls telemetry proves the device drives a load.
+                if (opts.heal) {
+                    const healState = c4.applyC4Heal(msg.device, currentType, {ls: true});
+                    if (healState) Object.assign(result, healState);
+                }
+
+                // Mute the raw c4_response for ls telemetry: the debounced publish
+                // below carries the level, and echoing both would double MQTT
+                // volume during a dim ramp.
+                delete result.c4_response;
+                delete result.c4_response_ep;
+
+                c4.scheduleC4LoadStatePublish(msg.device, loadStatus.level, publish);
+                return result;
+            }
 
             return result;
-        }
+        },
+    }) satisfies Fz.Converter<"genPowerCfg", undefined, ["raw"]>;
 
-        const loadStatus = c4.parseLoadStatus(text);
-        if (loadStatus) {
-            logger.debug(`${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
-
-            // Passive self-heal: ls telemetry proves the device drives a load.
-            const healState = c4.applyC4Heal(msg.device, currentType, {ls: true});
-            if (healState) Object.assign(result, healState);
-
-            // Mute the raw c4_response for ls telemetry: the debounced publish
-            // below carries the level, and echoing both would double MQTT
-            // volume during a dim ramp.
-            delete result.c4_response;
-            delete result.c4_response_ep;
-
-            c4.scheduleC4LoadStatePublish(msg.device, loadStatus.level, publish);
-            return result;
-        }
-
-        return result;
-    },
-} satisfies Fz.Converter<"genPowerCfg", undefined, ["raw"]>;
+const LEGACY_DM_FRAME = /\bsa c4\.dm\./;
+const fzControl4Response = makeFzControl4Response({heal: true, legacyDialect: true});
+const fzRosResponse = makeFzControl4Response({heal: false, legacyDialect: false});
 
 // Set LED colors, single ({"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}})
 // or batch ({"c4_led": {"top_on": "ffffff", "bottom_off": "0000ff", ...}}).
@@ -438,7 +452,7 @@ export const definitions: DefinitionWithExtend[] = [
         extend: [
             {
                 exposes: [e.switch(), e.action(c4.ACTION_VALUES.filter((action) => action.startsWith("button_1_")))],
-                fromZigbee: [fz.on_off, fzControl4Response],
+                fromZigbee: [fz.on_off, fzRosResponse],
                 toZigbee: [tzRosOnOff, tzControl4Cmd, tzControl4Query],
                 isModernExtend: true,
             },

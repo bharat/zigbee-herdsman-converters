@@ -1000,6 +1000,52 @@ describe("Control4 glue", () => {
                 vi.useRealTimers();
             }
         });
+
+        it.each(["0t1001 sa c4.dm.b0c", "0t1002 sa c4.dm.cc 00 01", "0t1003 sa c4.dm.t0c 64"])(
+            "ignores the legacy dialect frame %s",
+            async (frame) => {
+                vi.useFakeTimers();
+                try {
+                    // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+                    const handler = definition.fromZigbee.find((converter) => converter.cluster === "genPowerCfg") as any;
+                    const {device} = makeDevice("0x0E41", {});
+                    const msg = {data: Buffer.from(frame, "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+                    const result = await handler.convert(definition, msg, vi.fn(), {}, {state: {}, device});
+                    expect(result?.action).toBeUndefined();
+                    expect(result?.brightness).toBeUndefined();
+                    expect(result?.c4_device_type).toBeUndefined();
+                    expect(device.meta.c4_device_type).toBeUndefined();
+                    expect(result?.c4_response).toBe(frame);
+                } finally {
+                    resetC4HealState();
+                    vi.runOnlyPendingTimers();
+                    vi.useRealTimers();
+                }
+            },
+        );
+
+        it("never retypes the outlet on load telemetry", async () => {
+            vi.useFakeTimers();
+            try {
+                // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+                const handler = definition.fromZigbee.find((converter) => converter.cluster === "genPowerCfg") as any;
+                const {device} = makeDevice("0x0E42", {});
+                const msg = {
+                    data: Buffer.from("0t1004 sa c4.dmx.ls 00 00 64", "ascii"),
+                    endpoint: {ID: 197},
+                    device,
+                    type: "raw",
+                    cluster: "genPowerCfg",
+                };
+                const result = await handler.convert(definition, msg, vi.fn(), {}, {state: {}, device});
+                expect(result?.c4_device_type).toBeUndefined();
+                expect(device.meta.c4_device_type).toBeUndefined();
+            } finally {
+                resetC4HealState();
+                vi.runOnlyPendingTimers();
+                vi.useRealTimers();
+            }
+        });
     });
 
     describe("Frozen MQTT contract", () => {
