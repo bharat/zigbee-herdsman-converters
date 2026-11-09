@@ -230,7 +230,53 @@ function targetIdentity(target: C4ButtonTarget): {paddle: string} | {buttonId: n
     return target.paddle ? {paddle: target.paddle} : {buttonId: target.buttonId};
 }
 
+/**
+ * Legacy (pre-dmx) dimmers such as the C4-DIM1-Z speak the older "c4.dm."
+ * dialect, where paddle halves are wire ids 0 (top) and 1 (bottom) rather
+ * than the dmx paddle ids 0x07/0x08.
+ */
+export const LEGACY_DM_PADDLE_IDS: Record<number, string> = {
+    0: "paddle_up",
+    1: "paddle_down",
+};
+
+function resolveLegacyDmTarget(wireIdHex: string): C4ButtonTarget | null {
+    const wireId = Number.parseInt(wireIdHex, 16);
+    if (Number.isNaN(wireId)) return null;
+    const paddle = LEGACY_DM_PADDLE_IDS[wireId];
+    return paddle ? {prefix: paddle, paddle} : null;
+}
+
+function parseLegacyDmButtonEvent(text: string): C4ButtonEvent | null {
+    // Legacy paddle press: 0t<seq> sa c4.dm.b<id><phase>. Observed phases:
+    // "c" on a tap (followed later by cc), "b" when a hold-to-dim begins and
+    // "e" when it ends. Tap and hold-begin both map to <paddle>_press, matching
+    // the dmx bp-at-press-start semantics; hold-end is left unmapped so the
+    // frozen ACTION_VALUES enum is unchanged (it still surfaces as c4_response).
+    const pressMatch = text.match(/^0t\w+ sa c4\.dm\.b([0-9a-fA-F])[cb]\b/);
+    if (pressMatch) {
+        const target = resolveLegacyDmTarget(pressMatch[1]);
+        if (!target) return null;
+        return {action: `${target.prefix}_press`, ...targetIdentity(target), type: "press"};
+    }
+
+    // Legacy click count: 0t<seq> sa c4.dm.cc <id> <count>
+    const ccMatch = text.match(/^0t\w+ sa c4\.dm\.cc (\w+) (\w+)/);
+    if (ccMatch) {
+        const target = resolveLegacyDmTarget(ccMatch[1]);
+        if (!target) return null;
+        const count = Number.parseInt(ccMatch[2], 16);
+        if (Number.isNaN(count)) return null;
+        return {action: `${target.prefix}_click_${count}`, ...targetIdentity(target), clickCount: count, type: "click"};
+    }
+
+    return null;
+}
+
 export function parseButtonEvent(text: string): C4ButtonEvent | null {
+    const legacy = parseLegacyDmButtonEvent(text);
+    if (legacy) return legacy;
+
     // Button press: 0t<seq> sa c4.dmx.bp <btn>
     const bpMatch = text.match(/^0t\w+ sa c4\.dmx\.bp (\w+)/);
     if (bpMatch) {
@@ -259,12 +305,14 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     return null;
 }
 
-/** Parse ls telemetry ("0t<seq> sa c4.dmx.ls ..."): the third data field is the load level as a hex percent (0x00-0x64). */
+/** Parse load telemetry as a hex percent (0x00-0x64): dmx "c4.dmx.ls" (third data field) or legacy "c4.dm.t0c <level>". */
 export function parseLoadStatus(text: string): {level: number} | null {
-    const match = text.match(/^0t\w+ sa c4\.dmx\.ls (\w+) (\w+) (\w+)/);
+    // dmx telemetry: the third data field is the level. Legacy "c4.dm." dimmers
+    // (C4-DIM1-Z) instead report each ramp step as "c4.dm.t0c <level>".
+    const match = text.match(/^0t\w+ sa c4\.dmx\.ls \w+ \w+ (\w+)/) ?? text.match(/^0t\w+ sa c4\.dm\.t0c (\w+)/);
     if (!match) return null;
 
-    const level = Number.parseInt(match[3], 16);
+    const level = Number.parseInt(match[1], 16);
     if (Number.isNaN(level) || level > 0x64) {
         logger.warning(`Ignoring out-of-range load level: ${text}`, NS);
         return null;
