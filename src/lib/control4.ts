@@ -418,6 +418,75 @@ export function parseLoadStatus(text: string): {level: number} | null {
     return {level};
 }
 
+/** Number of data fields in a full ls frame; shorter frames carry no electrical readings. */
+const C4_LS_TELEMETRY_FIELDS = 10;
+
+/**
+ * Parse the electrical readings from a full ls frame, for example
+ * "0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000".
+ * After the level: volts, milliamps, watts, volt-amps, power factor x1000, and
+ * two fields of unknown meaning, published raw. The names are inferred from
+ * captured frames (V x mA = VA, VA x PF = W), not from documentation.
+ */
+export function parseLoadTelemetry(text: string): KeyValue | null {
+    const match = text.match(/^0t\w+ sa c4\.dmx\.ls\s+(.+)$/);
+    if (!match) return null;
+
+    const fields = match[1].trim().split(/\s+/);
+    if (fields.length < C4_LS_TELEMETRY_FIELDS || !fields.every((field) => /^[0-9a-fA-F]+$/.test(field))) return null;
+
+    const [voltage, currentMa, power, apparentPower, powerFactor, unknown9, unknown10] = fields.slice(3).map((field) => Number.parseInt(field, 16));
+    return {
+        c4_load_voltage: voltage,
+        c4_load_current: currentMa,
+        c4_load_power: power,
+        c4_load_apparent_power: apparentPower,
+        c4_load_power_factor: powerFactor / 1000,
+        c4_load_field_9: unknown9,
+        c4_load_field_10: unknown10,
+    };
+}
+
+/** Dimming table parameters readable with "c4.dm.tv 00 <param>". */
+export const C4_DIMMING_PARAMS = ["01", "02", "03", "04", "05", "06", "08", "09", "0a"];
+
+/** Parse a dimming table reply, "0r<seq> 000 c4.dm.tv 02ee" → 750, or null. */
+export function parseDimmingResponse(responseText?: string | null): number | null {
+    if (!responseText) return null;
+    const match = responseText.match(/000 c4\.dm\.tv ([0-9a-fA-F]+)$/);
+    return match ? Number.parseInt(match[1], 16) : null;
+}
+
+/**
+ * Read the dimming table as c4_tv_<param> state keys. A parameter is absent
+ * when its read timed out or the device rejected it. Replies don't echo the
+ * parameter, so the query's sequence number is what ties a reply to it.
+ */
+export async function readDimmingTable(device: Zh.Device): Promise<KeyValue> {
+    const state: KeyValue = {};
+    for (const param of C4_DIMMING_PARAMS) {
+        Object.assign(state, await readDimmingParam(device, param));
+    }
+    return state;
+}
+
+/** Read one dimming table parameter as its c4_tv_<param> state key; empty when there's no valid reply. */
+export async function readDimmingParam(device: Zh.Device, param: string): Promise<KeyValue> {
+    const value = parseDimmingResponse(await queryC4WithResponse(device, `c4.dm.tv 00 ${param}`, 2000));
+    return value === null ? {} : {[`c4_tv_${param}`]: value};
+}
+
+/**
+ * The parameter a raw command writes in the dimming table, "c4.dm.tv 00 02 000001f4" → "02", or null.
+ * Only C4_DIMMING_PARAMS count, so a read-back never publishes a c4_tv_* key outside the contract.
+ */
+export function parseDimmingWriteParam(command: string): string | null {
+    const match = command.match(/^c4\.dm\.tv 00 ([0-9a-fA-F]{2}) [0-9a-fA-F]+$/);
+    if (!match) return null;
+    const param = match[1].toLowerCase();
+    return C4_DIMMING_PARAMS.includes(param) ? param : null;
+}
+
 export type C4DeviceType = "dimmer" | "keypaddim" | "keypad";
 
 export const DIM_TYPE_MAP: Record<string, C4DeviceType> = {
@@ -760,10 +829,10 @@ const c4LastLsSeen = new Map<string, number>();
 
 /**
  * Trailing-edge throttle of ls telemetry: each frame resets the timer, so the
- * final publish always carries the settled level. Level 0 publishes OFF with
- * no brightness key, preserving the last-on level.
+ * final publish always carries the settled level and electrical readings.
+ * Level 0 publishes OFF with no brightness key, preserving the last-on level.
  */
-export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level: number, publish: Publish): void {
+export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level: number, publish: Publish, telemetry?: KeyValue | null): void {
     if (!device) return;
 
     const key = device.ieeeAddr;
@@ -776,7 +845,8 @@ export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level:
     entry.timer = setTimeout(() => {
         c4LoadStateTimers.delete(key);
         const lvl = entry.level;
-        publish(lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"});
+        const loadState = lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"};
+        publish(telemetry ? {...loadState, ...telemetry} : loadState);
     }, C4_LOAD_STATE_DEBOUNCE_MS);
 
     c4LoadStateTimers.set(key, entry);

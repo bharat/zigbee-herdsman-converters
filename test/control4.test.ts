@@ -32,9 +32,12 @@ import {
     nextSeq,
     normalizeColorHex,
     parseButtonEvent,
+    parseDimmingResponse,
+    parseDimmingWriteParam,
     parseDimResponse,
     parseLedColorResponse,
     parseLoadStatus,
+    parseLoadTelemetry,
     parseParamResponse,
     parseResponseSeq,
     resetC4ButtonLogState,
@@ -638,6 +641,47 @@ describe("Control4 protocol", () => {
 
         it("returns null for garbage text", () => {
             expect(parseLoadStatus("hello world")).toBeNull();
+        });
+    });
+
+    describe("parseLoadTelemetry", () => {
+        it("decodes a captured dimmer frame", () => {
+            expect(parseLoadTelemetry("0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000")).toEqual({
+                c4_load_voltage: 121,
+                c4_load_current: 112,
+                c4_load_power: 13,
+                c4_load_apparent_power: 14,
+                c4_load_power_factor: 0.938,
+                c4_load_field_9: 0,
+                c4_load_field_10: 0,
+            });
+        });
+
+        it("keeps the unknown field from a captured relay frame", () => {
+            expect(parseLoadTelemetry("0t6069 sa c4.dmx.ls 00 00 64 0081 00d2 0011 001b 0270 077c 0000")?.c4_load_field_9).toBe(1916);
+        });
+
+        it("ignores short frames and other telemetry", () => {
+            expect(parseLoadTelemetry("0t0001 sa c4.dmx.ls 00 00 04 0078 0000 0000")).toBeNull();
+            expect(parseLoadTelemetry("0t0001 sa c4.dmx.bp 01")).toBeNull();
+        });
+    });
+
+    describe("parseDimmingWriteParam", () => {
+        it("finds the parameter in a write and ignores anything else", () => {
+            expect(parseDimmingWriteParam("c4.dm.tv 00 0A 000001f4")).toBe("0a");
+            expect(parseDimmingWriteParam("c4.dm.tv 00 02")).toBeNull();
+            expect(parseDimmingWriteParam("c4.dmx.led 01 03 ff0000")).toBeNull();
+            // 07 isn't a dimming table parameter, so it has no c4_tv_* key.
+            expect(parseDimmingWriteParam("c4.dm.tv 00 07 00000001")).toBeNull();
+        });
+    });
+
+    describe("parseDimmingResponse", () => {
+        it("decodes a reply and rejects anything else", () => {
+            expect(parseDimmingResponse("0r62ac 000 c4.dm.tv 02ee")).toBe(750);
+            expect(parseDimmingResponse("0r62ac n01")).toBeNull();
+            expect(parseDimmingResponse(null)).toBeNull();
         });
     });
 
