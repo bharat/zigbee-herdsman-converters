@@ -454,6 +454,19 @@ describe("Control4 protocol", () => {
             expect(parseButtonEvent("0t0001 sa c4.dmx.cc 01 01")).toEqual({action: "button_2_click_1", buttonId: 2, clickCount: 1, type: "click"});
         });
 
+        it("clamps click counts to the declared click_1..click_4 range", () => {
+            expect(parseButtonEvent("0t0001 sa c4.dmx.cc 00 07")).toEqual({action: "button_1_click_4", buttonId: 1, clickCount: 4, type: "click"});
+            expect(parseButtonEvent("0t0001 sa c4.dmx.cc 00 00")).toEqual({action: "button_1_click_1", buttonId: 1, clickCount: 1, type: "click"});
+            expect(parseButtonEvent("0tdc27 sa c4.dm.cc 00 ff")?.action).toBe("paddle_up_click_4");
+            for (const action of [parseButtonEvent("0t0001 sa c4.dmx.cc 03 ff")?.action, parseButtonEvent("0tdc28 sa c4.dm.cc 01 09")?.action]) {
+                expect(ACTION_VALUES).toContain(action);
+            }
+        });
+
+        it("ignores a click count that isn't hex", () => {
+            expect(parseButtonEvent("0t0001 sa c4.dmx.cc 00 zz")).toBeNull();
+        });
+
         it("parses scene change (sc): wire 02 becomes button 3", () => {
             expect(parseButtonEvent("0t0001 sa c4.dmx.sc 02")).toEqual({action: "button_3_scene", buttonId: 3, type: "scene"});
         });

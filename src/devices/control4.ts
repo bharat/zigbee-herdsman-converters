@@ -71,7 +71,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
                 // Passive self-heal: a load paddle half only exists on
                 // load-bearing hardware.
                 if (opts.heal && event.paddle) {
-                    const healState = c4.applyC4Heal(msg.device, currentType, {paddle: true});
+                    const healState = c4.applyC4Heal(msg.device, currentType, {paddle: true, legacy: LEGACY_DM_FRAME.test(text)});
                     if (healState) Object.assign(result, healState);
                 }
 
@@ -95,7 +95,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
 
                 // Passive self-heal: ls telemetry proves the device drives a load.
                 if (opts.heal) {
-                    const healState = c4.applyC4Heal(msg.device, currentType, {ls: true});
+                    const healState = c4.applyC4Heal(msg.device, currentType, {ls: true, legacy: LEGACY_DM_FRAME.test(text)});
                     if (healState) Object.assign(result, healState);
                 }
 
