@@ -16,6 +16,7 @@ import {
     BEHAVIOR_FROM_FIRMWARE,
     C4_CONFIDENCE_ASSUMED,
     C4_CONFIDENCE_CONFIRMED,
+    C4_DIMMING_PARAMS,
     C4_LOAD_STATE_DEBOUNCE_MS,
     C4_MAX_SILENT_PROBES,
     C4_STATE_READ_DEBOUNCE_MS,
@@ -26,6 +27,7 @@ import {
     isC4DimNegativeResponse,
     LED_MODE_FROM_FIRMWARE,
     parseC4Identity,
+    parseLoadTelemetry,
     readC4Identity,
     readStoredSlotConfig,
     resetC4HealState,
@@ -1189,9 +1191,39 @@ describe("Control4 glue", () => {
 
         it("toZigbee accepts the frozen command keys", () => {
             const keys = (definition.toZigbee ?? []).flatMap((tz) => tz.key ?? []);
-            for (const frozen of ["c4_led", "c4_cmd", "c4_query", "zcl_read", "c4_probe", "c4_detect", "c4_verify_slot"]) {
+            for (const frozen of ["c4_led", "c4_cmd", "c4_query", "zcl_read", "c4_probe", "c4_detect", "c4_verify_slot", "c4_read_dimming"]) {
                 expect(keys).toContain(frozen);
             }
+        });
+
+        it("load telemetry publishes exactly the frozen c4_load_* keys", () => {
+            const telemetry = parseLoadTelemetry("0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000");
+            expect(Object.keys(telemetry ?? {}).sort()).toEqual(
+                [
+                    "c4_load_voltage",
+                    "c4_load_current",
+                    "c4_load_power",
+                    "c4_load_apparent_power",
+                    "c4_load_power_factor",
+                    "c4_load_field_9",
+                    "c4_load_field_10",
+                ].sort(),
+            );
+        });
+
+        it("dimming table reads publish exactly the frozen c4_tv_* keys", () => {
+            // The integration's number entities subscribe to these names.
+            expect(C4_DIMMING_PARAMS.map((param) => `c4_tv_${param}`)).toEqual([
+                "c4_tv_01",
+                "c4_tv_02",
+                "c4_tv_03",
+                "c4_tv_04",
+                "c4_tv_05",
+                "c4_tv_06",
+                "c4_tv_08",
+                "c4_tv_09",
+                "c4_tv_0a",
+            ]);
         });
 
         it("read-back reverse maps exactly invert the integration's firmware tables", () => {
