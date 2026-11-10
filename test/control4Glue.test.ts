@@ -241,6 +241,16 @@ describe("Control4 glue", () => {
             expect(publish).toHaveBeenCalledWith(expect.objectContaining({c4_device_type: "keypaddim"}));
         });
 
+        it("names legacy c4.dm. frames as the heal evidence", () => {
+            const {device: paddleDevice} = makeDevice("0x0A0A", {c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
+            const paddleState = applyC4Heal(asDevice(paddleDevice), "keypad", {paddle: true, legacy: true}, vi.fn());
+            expect((paddleState?.c4_detect_result as KeyValue | undefined)?.evidence).toBe("legacy c4.dm. paddle telemetry");
+
+            const {device: loadDevice} = makeDevice("0x0A0B", {c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
+            const loadState = applyC4Heal(asDevice(loadDevice), "keypad", {ls: true, legacy: true}, vi.fn());
+            expect((loadState?.c4_detect_result as KeyValue | undefined)?.evidence).toBe("legacy c4.dm.t0c load telemetry");
+        });
+
         it("paddle telemetry does not downgrade an existing dimmer", () => {
             const {device} = makeDevice("0x0A08", {c4_device_type: "dimmer", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
             const publish = vi.fn();

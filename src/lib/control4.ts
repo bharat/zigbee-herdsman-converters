@@ -267,10 +267,17 @@ function parseLegacyDmButtonEvent(text: string): C4ButtonEvent | null {
         if (!target) return null;
         const count = Number.parseInt(ccMatch[2], 16);
         if (Number.isNaN(count)) return null;
-        return {action: `${target.prefix}_click_${count}`, ...targetIdentity(target), clickCount: count, type: "click"};
+        const clicks = clampClickCount(count);
+        return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }
 
     return null;
+}
+
+// Firmware counts every tap of a burst, but the frozen action enum only goes up
+// to click_4, so anything past that reports as the highest declared count.
+function clampClickCount(count: number): number {
+    return Math.min(Math.max(count, 1), 4);
 }
 
 export function parseButtonEvent(text: string): C4ButtonEvent | null {
@@ -291,7 +298,9 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
         const target = resolveButtonTarget(ccMatch[1]);
         if (!target) return null;
         const count = Number.parseInt(ccMatch[2], 16);
-        return {action: `${target.prefix}_click_${count}`, ...targetIdentity(target), clickCount: count, type: "click"};
+        if (Number.isNaN(count)) return null;
+        const clicks = clampClickCount(count);
+        return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }
 
     // Scene change: 0t<seq> sa c4.dmx.sc <btn>
@@ -387,6 +396,8 @@ export interface C4HealEvidence {
     dimCode?: string | null;
     ls?: boolean;
     paddle?: boolean;
+    // The ls or paddle evidence came from a legacy c4.dm.* frame.
+    legacy?: boolean;
 }
 
 /**
@@ -801,9 +812,9 @@ export function applyC4Heal(
     if (evidence.dimCode != null) {
         evidenceDesc = `c4.dmx.dim answer ${evidence.dimCode}`;
     } else if (evidence.paddle) {
-        evidenceDesc = "c4.dmx.bp local load paddle telemetry";
+        evidenceDesc = evidence.legacy ? "legacy c4.dm. paddle telemetry" : "c4.dmx.bp local load paddle telemetry";
     } else {
-        evidenceDesc = "c4.dmx.ls load telemetry";
+        evidenceDesc = evidence.legacy ? "legacy c4.dm.t0c load telemetry" : "c4.dmx.ls load telemetry";
     }
 
     logger.info(`${device.ieeeAddr}: ${currentType ?? "(none)"} -> ${newType} (evidence: ${evidenceDesc})`, NS);
