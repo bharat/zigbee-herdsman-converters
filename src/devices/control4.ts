@@ -200,7 +200,11 @@ const tzControl4Cmd = {
 
         // Keep Z2M's cached dimming table right whichever way a write arrives.
         const dimmingParam = c4.parseDimmingWriteParam(value);
-        if (dimmingParam) meta.publish(await c4.readDimmingParam(meta.device, dimmingParam));
+        if (dimmingParam) {
+            const readBack = await c4.readDimmingParam(meta.device, dimmingParam);
+            // No reply: leave the cached value alone rather than publish an empty state.
+            if (Object.keys(readBack).length > 0) meta.publish(readBack);
+        }
 
         return {state: {c4_last_cmd: sent}};
     },

@@ -476,10 +476,15 @@ export async function readDimmingParam(device: Zh.Device, param: string): Promis
     return value === null ? {} : {[`c4_tv_${param}`]: value};
 }
 
-/** The parameter a raw command writes in the dimming table, "c4.dm.tv 00 02 000001f4" → "02", or null. */
+/**
+ * The parameter a raw command writes in the dimming table, "c4.dm.tv 00 02 000001f4" → "02", or null.
+ * Only C4_DIMMING_PARAMS count, so a read-back never publishes a c4_tv_* key outside the contract.
+ */
 export function parseDimmingWriteParam(command: string): string | null {
     const match = command.match(/^c4\.dm\.tv 00 ([0-9a-fA-F]{2}) [0-9a-fA-F]+$/);
-    return match ? match[1].toLowerCase() : null;
+    if (!match) return null;
+    const param = match[1].toLowerCase();
+    return C4_DIMMING_PARAMS.includes(param) ? param : null;
 }
 
 export type C4DeviceType = "dimmer" | "keypaddim" | "keypad";

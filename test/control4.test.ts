@@ -672,6 +672,8 @@ describe("Control4 protocol", () => {
             expect(parseDimmingWriteParam("c4.dm.tv 00 0A 000001f4")).toBe("0a");
             expect(parseDimmingWriteParam("c4.dm.tv 00 02")).toBeNull();
             expect(parseDimmingWriteParam("c4.dmx.led 01 03 ff0000")).toBeNull();
+            // 07 isn't a dimming table parameter, so it has no c4_tv_* key.
+            expect(parseDimmingWriteParam("c4.dm.tv 00 07 00000001")).toBeNull();
         });
     });
 

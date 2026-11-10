@@ -910,6 +910,15 @@ describe("Control4 glue", () => {
             expect(publish).not.toHaveBeenCalled();
         });
 
+        it("c4_cmd skips the publish when a dimming read-back gets no reply", async () => {
+            const convertCmd = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_cmd"))?.convertSet as AnyFn;
+            const {device} = makeRespondingDevice("0x0F07", () => null);
+            const publish = vi.fn();
+
+            await convertCmd(undefined, "c4_cmd", "c4.dm.tv 00 02 000001f4", {device: asDevice(device), publish, state: {}, message: {}});
+            expect(publish).not.toHaveBeenCalled();
+        });
+
         it("c4_read_dimming publishes every answered parameter", async () => {
             const convertRead = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_read_dimming"))?.convertSet as AnyFn;
             const {device} = makeRespondingDevice("0x0F07", () => "000 c4.dm.tv 0064");
