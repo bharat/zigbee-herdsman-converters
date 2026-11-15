@@ -13,19 +13,24 @@ import {
     ACTION_VALUES,
     applyC4Heal,
     applyC4Identity,
+    applyC4ModelType,
     BEHAVIOR_FROM_FIRMWARE,
     C4_CONFIDENCE_ASSUMED,
     C4_CONFIDENCE_CONFIRMED,
     C4_DIMMING_PARAMS,
     C4_LOAD_STATE_DEBOUNCE_MS,
     C4_MAX_SILENT_PROBES,
+    C4_MODEL_TYPES,
     C4_STATE_READ_DEBOUNCE_MS,
     c4ArmProbeOnStart,
+    c4ModelType,
     classifyDimProbeResponse,
+    detectDeviceType,
     effectiveConfidence,
     healTypeFromEvidence,
     isC4DimNegativeResponse,
     LED_MODE_FROM_FIRMWARE,
+    modelDeviceType,
     parseC4Identity,
     parseLoadTelemetry,
     readC4Identity,
@@ -1133,13 +1138,16 @@ describe("Control4 glue", () => {
 
         it("publishes and stores model and firmware from an endpoint 2 report", async () => {
             const {device} = makeDevice("0x0F01");
-            expect(await convert(2, device)).toEqual({c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            // A C4-KD120 also fixes the device type, published alongside (see "Typing from the reported model").
+            expect(await convert(2, device)).toEqual(
+                expect.objectContaining({c4_model: "C4-KD120", c4_firmware: "5.1.1", c4_device_type: "keypaddim"}),
+            );
             expect(device.meta.c4_model).toBe("C4-KD120");
             expect(device.meta.c4_firmware).toBe("5.1.1");
             // Shown by Zigbee2MQTT as the model (via whiteLabel) and firmware
             expect((device as unknown as Zh.Device).modelID).toBe("C4-KD120");
             expect((device as unknown as Zh.Device).softwareBuildID).toBe("5.1.1");
-            expect(device.save).toHaveBeenCalledTimes(1);
+            expect(device.save).toHaveBeenCalled();
         });
 
         it("leaves the placeholder modelID alone for a model the definition does not list", () => {
@@ -1158,9 +1166,14 @@ describe("Control4 glue", () => {
         });
 
         it("publishes nothing when the repeated report has not changed", async () => {
-            const {device} = makeDevice("0x0F02", {c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            const {device} = makeDevice("0x0F02", {
+                c4_model: "C4-KD120",
+                c4_firmware: "5.1.1",
+                c4_device_type: "keypaddim",
+                c4_type_confidence: C4_CONFIDENCE_CONFIRMED,
+            });
             Object.assign(device, {modelID: "C4-KD120", softwareBuildID: "5.1.1"});
-            expect(await convert(2, device, {c4_model: "C4-KD120", c4_firmware: "5.1.1"})).toBeUndefined();
+            expect(await convert(2, device, {c4_model: "C4-KD120", c4_firmware: "5.1.1", c4_device_type: "keypaddim"})).toBeUndefined();
             expect(device.save).not.toHaveBeenCalled();
         });
 
@@ -1183,6 +1196,334 @@ describe("Control4 glue", () => {
             expect(await readC4Identity(device as unknown as Zh.Device)).toEqual({model: "C4-KD120", firmware: "5.1.1"});
             expect(device.createEndpoint).toHaveBeenCalledWith(2);
             expect(read).toHaveBeenCalledWith(1, [0x0004, 0x0007], {profileId: 0xc25d, srcEndpoint: 2, timeout: 10000});
+        });
+    });
+
+    describe("Typing from the reported model", () => {
+        // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz/tz convert signatures
+        type AnyFn = (...args: any[]) => any;
+        const definition = definitions[0];
+        const [rawFz, identityFz] = definition.fromZigbee as unknown as [{convert: AnyFn}, {convert: AnyFn}];
+        const tzDetect = (definition.toZigbee ?? []).find((tz) => tz.key?.includes("c4_detect"));
+
+        function identityReport(device: MockDevice, model: string, state: KeyValue = {}): Promise<KeyValue | undefined> {
+            const msg = {
+                data: {4: "5.1.1", 7: `c4:control4_light:${model}`},
+                endpoint: {ID: 2},
+                device,
+                type: "attributeReport",
+                cluster: "genPowerCfg",
+            };
+            return identityFz.convert(definition, msg, vi.fn(), {}, {state, device});
+        }
+
+        function raw(text: string, device: MockDevice, state: KeyValue = {}): Promise<KeyValue | undefined> {
+            const msg = {data: Buffer.from(text, "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+            return rawFz.convert(definition, msg, vi.fn(), {}, {state, device});
+        }
+
+        /**
+         * A device whose EP1 answers c4.dmx.dim with `dimCode` (null = silence) and
+         * every LED color query with white, through the real pending-query machinery.
+         */
+        function makeDimDevice(ieeeAddr: string, dimCode: string | null, meta: KeyValue = {}) {
+            const sendRaw = vi.fn((_cluster: number, data: Buffer): Promise<void> => {
+                const match = data
+                    .toString("ascii")
+                    .trim()
+                    .match(/^0g(\w{4}) (.+)$/);
+                if (match) {
+                    const [, seq, cmdBody] = match;
+                    const answer = cmdBody === "c4.dmx.dim" ? (dimCode === null ? null : `000 c4.dmx.dim ${dimCode}`) : "000 c4.dmx.led ffffff";
+                    if (answer !== null) queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                }
+                return Promise.resolve();
+            });
+            const ep1 = {ID: 1, read: vi.fn(async () => ({})), command: vi.fn(async () => ({})), bind: vi.fn(async () => {}), sendRaw};
+            const device = {
+                ieeeAddr,
+                meta: {...meta},
+                save: vi.fn(),
+                getEndpoint: vi.fn((id: number) => (id === 1 ? ep1 : undefined)),
+            };
+            return {device: device as MockDevice, ep1};
+        }
+
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+
+        afterEach(() => {
+            resetC4HealState();
+            vi.runOnlyPendingTimers();
+            vi.useRealTimers();
+        });
+
+        it.each([
+            ["C4-APD120", "dimmer"],
+            ["C4-KD120", "keypaddim"],
+            ["C4-KC120277", "keypad"],
+        ])("types a %s as %s", (model, type) => {
+            expect(modelDeviceType(model)).toBe(type);
+            expect(C4_MODEL_TYPES[model]).toBe(type);
+        });
+
+        it.each(["C4-SW120277", "C4-V-ROSW120", "C4-NEW999", "C4-Zigbee", "constructor", "__proto__", undefined])("fixes no type for %s", (model) => {
+            expect(modelDeviceType(model)).toBeUndefined();
+        });
+
+        it("takes the model from meta, then published state, then a rewritten modelID", () => {
+            const {device} = makeDevice("0x1001", {c4_model: "C4-KD120"});
+            expect(c4ModelType(asDevice(device))).toEqual({model: "C4-KD120", type: "keypaddim"});
+
+            const {device: fromState} = makeDevice("0x1002");
+            expect(c4ModelType(asDevice(fromState), {c4_model: "C4-APD120"})).toEqual({model: "C4-APD120", type: "dimmer"});
+
+            const {device: fromModelID} = makeDevice("0x1003");
+            Object.assign(fromModelID, {modelID: "C4-KC120277"});
+            expect(c4ModelType(asDevice(fromModelID))).toEqual({model: "C4-KC120277", type: "keypad"});
+
+            const {device: placeholder} = makeDevice("0x1004");
+            Object.assign(placeholder, {modelID: "C4-Zigbee"});
+            expect(c4ModelType(asDevice(placeholder))).toBeUndefined();
+
+            // A reported model with no fixed type is not overridden by the modelID.
+            const {device: relay} = makeDevice("0x1005", {c4_model: "C4-SW120277"});
+            Object.assign(relay, {modelID: "C4-SW120277"});
+            expect(c4ModelType(asDevice(relay))).toBeUndefined();
+        });
+
+        it("detects a C4-KD120 that answers dim code 01 as keypaddim", async () => {
+            const {device} = makeDimDevice("0x1010", "01", {c4_model: "C4-KD120"});
+
+            const detection = await detectDeviceType(asDevice(device));
+
+            expect(detection).toEqual({deviceType: "keypaddim", dimCode: "01", confidence: C4_CONFIDENCE_CONFIRMED, model: "C4-KD120"});
+        });
+
+        it("detects a C4-APD120 that answers dim code 02 as dimmer", async () => {
+            const {device} = makeDimDevice("0x1011", "02", {c4_model: "C4-APD120"});
+            expect((await detectDeviceType(asDevice(device))).deviceType).toBe("dimmer");
+        });
+
+        it("detects a C4-KC120277 as a confirmed keypad even when the dim probe is silent", async () => {
+            const {device} = makeDimDevice("0x1012", null, {c4_model: "C4-KC120277"});
+            const pending = detectDeviceType(asDevice(device));
+            await vi.advanceTimersByTimeAsync(3000);
+            expect(await pending).toEqual({deviceType: "keypad", dimCode: null, confidence: C4_CONFIDENCE_CONFIRMED, model: "C4-KC120277"});
+        });
+
+        it.each([
+            ["no model", {}],
+            ["an unknown model", {c4_model: "C4-NEW999"}],
+        ])("falls back to the dim code with %s", async (_label, meta) => {
+            const {device} = makeDimDevice("0x1013", "01", meta);
+            expect(await detectDeviceType(asDevice(device))).toEqual({deviceType: "dimmer", dimCode: "01", confidence: C4_CONFIDENCE_CONFIRMED});
+
+            const {device: keypad} = makeDimDevice("0x1014", null, meta);
+            const pending = detectDeviceType(asDevice(keypad));
+            await vi.advanceTimersByTimeAsync(3000);
+            expect(await pending).toEqual({deviceType: "keypad", dimCode: null, confidence: C4_CONFIDENCE_ASSUMED});
+        });
+
+        it("keeps typing a C4-SW120277 from its dim code (00 → keypaddim)", async () => {
+            const {device} = makeDimDevice("0x1015", "00", {c4_model: "C4-SW120277"});
+            expect(await detectDeviceType(asDevice(device))).toEqual({deviceType: "keypaddim", dimCode: "00", confidence: C4_CONFIDENCE_CONFIRMED});
+        });
+
+        it("c4_detect publishes the model-derived type with the real dim code", async () => {
+            const {device} = makeDimDevice("0x1016", "01", {c4_model: "C4-KD120"});
+
+            const result = await tzDetect?.convertSet?.(device as never, "c4_detect", true, {device, state: {}} as never);
+
+            const state = (result as {state: KeyValue}).state;
+            expect(state.c4_device_type).toBe("keypaddim");
+            expect(state.c4_detect_result).toEqual(
+                expect.objectContaining({device_type: "keypaddim", dim_code: "01", model: "C4-KD120", evidence: "reported model C4-KD120"}),
+            );
+            // All six slots are read for a keypad dimmer, not just the dimmer's two.
+            expect(Object.keys(state).filter((key) => key.startsWith("c4_led_"))).toHaveLength(12);
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_dim_code).toBe("01");
+        });
+
+        it("configure reads the identity first and types a fresh C4-KD120 from it", async () => {
+            const {device, ep1} = makeDimDevice("0x1017", "01");
+            const ep2 = {ID: 2, read: vi.fn(async () => ({4: "5.1.1", 7: "c4:control4_light:C4-KD120"}))};
+            Object.assign(device, {modelID: "C4-Zigbee", createEndpoint: vi.fn(() => ep2)});
+
+            await definition.configure?.(asDevice(device), {} as Zh.Endpoint, definition as never);
+
+            expect(ep1.bind).toHaveBeenCalled();
+            expect(device.meta.c4_model).toBe("C4-KD120");
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_type_confidence).toBe(C4_CONFIDENCE_CONFIRMED);
+            expect(device.meta.c4_dim_code).toBe("01");
+        });
+
+        it("corrects a stored wrong type on the next identity report and publishes it", async () => {
+            // The owner's "Master Main": a C4-KD120 typed dimmer from dim code 01.
+            const meta = {c4_device_type: "dimmer", c4_type_confidence: C4_CONFIDENCE_CONFIRMED, c4_dim_code: "01"};
+            const {device} = makeDevice("0x1020", meta);
+
+            const result = await identityReport(device, "C4-KD120", {c4_device_type: "dimmer"});
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    c4_model: "C4-KD120",
+                    c4_device_type: "keypaddim",
+                    c4_detect_result: expect.objectContaining({
+                        device_type: "keypaddim",
+                        confidence: C4_CONFIDENCE_CONFIRMED,
+                        dim_code: "01",
+                        model: "C4-KD120",
+                        healed: true,
+                        evidence: "reported model C4-KD120",
+                    }),
+                }),
+            );
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_type_confidence).toBe(C4_CONFIDENCE_CONFIRMED);
+            expect(device.meta.c4_dim_code).toBe("01");
+
+            // Once corrected, the repeating report publishes nothing more.
+            const state = {c4_model: "C4-KD120", c4_firmware: "5.1.1", c4_device_type: "keypaddim"};
+            expect(await identityReport(device, "C4-KD120", state)).toBeUndefined();
+        });
+
+        it("republishes the type when only the published state is stale", async () => {
+            const {device} = makeDevice("0x1021", {
+                c4_model: "C4-KD120",
+                c4_firmware: "5.1.1",
+                c4_device_type: "keypaddim",
+                c4_type_confidence: C4_CONFIDENCE_CONFIRMED,
+            });
+            Object.assign(device, {modelID: "C4-KD120", softwareBuildID: "5.1.1"});
+
+            const result = await identityReport(device, "C4-KD120", {c4_model: "C4-KD120", c4_firmware: "5.1.1", c4_device_type: "dimmer"});
+
+            expect(result).toEqual({c4_device_type: "keypaddim", c4_detect_result: expect.objectContaining({healed: true})});
+            expect(device.save).not.toHaveBeenCalled();
+        });
+
+        it("corrects a stored wrong type at startup without probing", async () => {
+            const {device} = makeDevice("0x1022", {c4_model: "C4-APD120", c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+            const probeFn = vi.fn(async () => null);
+
+            c4ArmProbeOnStart(asDevice(device), {c4_device_type: "keypaddim"}, {probeFn, random: () => 0});
+            await vi.advanceTimersByTimeAsync(120000);
+
+            expect(device.meta.c4_device_type).toBe("dimmer");
+            expect(probeFn).not.toHaveBeenCalled();
+        });
+
+        it("corrects a stored wrong type on the next C4 message", async () => {
+            const {device} = makeDevice("0x1023", {c4_model: "C4-KD120", c4_device_type: "dimmer", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+
+            const result = await raw("0t0001 sa c4.dmx.bp 00", device, {c4_device_type: "dimmer"});
+
+            expect(result?.action).toBe("button_1_press");
+            expect(result?.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+        });
+
+        it("a dim answer can't flip a model-typed device back", async () => {
+            const {device} = makeDevice("0x1024", {c4_model: "C4-KD120", c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+
+            const result = await raw("0r0001 000 c4.dmx.dim 01", device, {c4_device_type: "keypaddim"});
+
+            expect(result?.c4_device_type).toBeUndefined();
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+            expect(device.save).not.toHaveBeenCalled();
+        });
+
+        it.each([
+            ["C4-KD120", "keypaddim", {dimCode: "01"}],
+            ["C4-APD120", "dimmer", {dimCode: "02"}],
+            ["C4-KC120277", "keypad", {dimCode: "02"}],
+            ["C4-KC120277", "keypad", {ls: true}],
+            ["C4-KC120277", "keypad", {paddle: true}],
+        ])("heal evidence leaves a %s at %s", (model, type, evidence) => {
+            const {device} = makeDevice("0x1025", {c4_model: model, c4_device_type: type, c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+            const publish = vi.fn();
+
+            expect(applyC4Heal(asDevice(device), type, evidence, publish)).toBeNull();
+            expect(device.meta.c4_device_type).toBe(type);
+            expect(publish).not.toHaveBeenCalled();
+        });
+
+        it("heal evidence on a stale model-typed device restores the model's type", () => {
+            const {device} = makeDevice("0x1026", {c4_model: "C4-KD120", c4_device_type: "dimmer", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+
+            const state = applyC4Heal(asDevice(device), "dimmer", {dimCode: "01"}, vi.fn());
+
+            expect(state?.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+        });
+
+        it("never probes a model-typed keypad", async () => {
+            const {device} = makeDevice("0x1027", {c4_model: "C4-KC120277", c4_device_type: "keypad"});
+            const probeFn = vi.fn(async () => "01");
+
+            scheduleC4ProbeCampaign(asDevice(device), "keypad", vi.fn(), {probeFn, random: () => 0});
+            await vi.advanceTimersByTimeAsync(120000);
+
+            expect(probeFn).not.toHaveBeenCalled();
+            expect(device.meta.c4_device_type).toBe("keypad");
+        });
+
+        it("a probe campaign stops and types from the model once it becomes known", async () => {
+            const {device} = makeDevice("0x1028", {c4_device_type: "keypad"});
+            const publish = vi.fn();
+            const probeFn = vi.fn(() => {
+                // The identity report lands while the probe is in flight.
+                device.meta.c4_model = "C4-KD120";
+                return Promise.resolve(null);
+            });
+
+            scheduleC4ProbeCampaign(asDevice(device), "keypad", publish, {probeFn, random: () => 0, backoffMs: 1000});
+            await vi.advanceTimersByTimeAsync(60000);
+
+            expect(probeFn).toHaveBeenCalledTimes(1);
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+            expect(publish).toHaveBeenCalledWith(expect.objectContaining({c4_device_type: "keypaddim"}));
+        });
+
+        it("an unknown model keeps today's dim-code heal", async () => {
+            const {device} = makeDevice("0x1029", {c4_model: "C4-NEW999", c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
+
+            const result = await raw("0r0001 000 c4.dmx.dim 01", device, {c4_device_type: "keypad"});
+
+            expect(result?.c4_device_type).toBe("dimmer");
+            expect(device.meta.c4_device_type).toBe("dimmer");
+        });
+
+        it("a C4-SW120277 keeps today's typing: dim-code heal, and no type from its identity report", async () => {
+            const {device} = makeDevice("0x102a", {c4_model: "C4-SW120277", c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
+            Object.assign(device, {modelID: "C4-SW120277"});
+
+            const healed = await raw("0r0001 000 c4.dmx.dim 00", device, {c4_device_type: "keypad"});
+            expect(healed?.c4_device_type).toBe("keypaddim");
+            expect((healed?.c4_detect_result as KeyValue | undefined)?.dim_code).toBe("00");
+
+            const report = await identityReport(device, "C4-SW120277", {c4_model: "C4-SW120277", c4_device_type: "keypaddim"});
+            expect(report).toEqual({c4_firmware: "5.1.1"});
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+        });
+
+        it("the C4-V-ROSW120 outlet still never reports a type", async () => {
+            const outlet = prepareDefinition(definitions[1]);
+            // biome-ignore lint/suspicious/noExplicitAny: mock plumbing for the fz convert signature
+            const handler = outlet.fromZigbee.find((converter) => converter.cluster === "genPowerCfg") as any;
+            const {device} = makeDevice("0x102b", {c4_model: "C4-V-ROSW120"});
+            Object.assign(device, {modelID: "c4:control4_light:C4-V-ROSW120"});
+            const msg = {data: Buffer.from("0r0001 000 c4.dmx.dim 01", "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+
+            const result = await handler.convert(outlet, msg, vi.fn(), {}, {state: {}, device});
+
+            expect(result?.c4_device_type).toBeUndefined();
+            expect(device.meta.c4_device_type).toBeUndefined();
+            expect(applyC4ModelType(asDevice(device), {})).toBeUndefined();
         });
     });
 

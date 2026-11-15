@@ -50,7 +50,17 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
 
             if (!opts.legacyDialect && LEGACY_DM_FRAME.test(text)) return result;
 
-            const currentType = (meta.state?.c4_device_type as string | undefined) ?? (msg.device?.meta.c4_device_type as string | undefined);
+            let currentType = (meta.state?.c4_device_type as string | undefined) ?? (msg.device?.meta.c4_device_type as string | undefined);
+
+            // A known model fixes the type: bring a stale stored or published
+            // type back to it before anything else looks at the type.
+            if (opts.heal) {
+                const modelState = c4.applyC4ModelType(msg.device, meta.state);
+                if (modelState) {
+                    Object.assign(result, modelState);
+                    currentType = modelState.c4_device_type as string;
+                }
+            }
 
             // Arm the self-heal campaign on the first message from an assumed
             // keypad (idempotent; no-op for load types and confirmed keypads).
@@ -119,13 +129,17 @@ const fzRosResponse = makeFzControl4Response({heal: false, legacyDialect: false}
 
 // Model and firmware arrive on the identity profile (0xC25D) as standard ZCL
 // frames from endpoint 2, cluster 1: an attribute report about once a minute,
-// or the answer to readC4Identity. Published only when they change.
+// or the answer to readC4Identity. Published only when they change. A model
+// that fixes the device type also corrects a stored or published type that
+// disagrees with it (a device typed from its dim code before the model was known).
 const fzControl4Identity = {
     cluster: "genPowerCfg",
     type: ["attributeReport", "readResponse"],
     convert: (model, msg, publish, options, meta) => {
         if (msg.endpoint?.ID !== c4.C4_IDENTITY_ENDPOINT) return;
-        return c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
+        const identityState = c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
+        const typeState = c4.applyC4ModelType(msg.device, meta.state);
+        return identityState || typeState ? {...identityState, ...typeState} : undefined;
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["attributeReport", "readResponse"]>;
 
@@ -325,7 +339,7 @@ const tzControl4Detect = {
         const device = meta.device;
         if (!device) throw new Error("c4_detect requires a device");
 
-        const {deviceType, dimCode, confidence} = await c4.detectDeviceType(device);
+        const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
         const colorState = await c4.readStoredColors(device, deviceType);
 
         const state: KeyValue = {
@@ -345,9 +359,10 @@ const tzControl4Detect = {
             device_type: deviceType,
             confidence,
             dim_code: dimCode ?? null,
-            model: c4.MODEL_NAMES[deviceType] ?? "unknown",
+            model: model ?? c4.MODEL_NAMES[deviceType] ?? "unknown",
             description: c4.MODEL_DESCRIPTIONS[deviceType] ?? "Unknown Control4 device",
             colors_read: Object.keys(colorState).length,
+            ...(model ? {evidence: `reported model ${model}`} : {}),
         };
 
         logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
@@ -468,24 +483,30 @@ export const definitions: DefinitionWithExtend[] = [
                 logger.info(`Cluster binding failed (may be normal for keypads): ${(err as Error).message}`, NS);
             }
 
+            // Read the identity first: a known model decides the device type
+            // below. The answer also flows through fzControl4Identity, which
+            // publishes it; storing it here as well doesn't wait on that.
             try {
-                const {deviceType, dimCode, confidence} = await c4.detectDeviceType(device);
+                const identity = await c4.readC4Identity(device);
+                c4.applyC4Identity(device, identity, undefined);
+                logger.info(`Identity: ${identity.model ?? "?"} firmware ${identity.firmware ?? "?"}`, NS);
+            } catch (err) {
+                logger.info(`Identity read failed (the periodic report will fill it in): ${(err as Error).message}`, NS);
+            }
+
+            try {
+                const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
                 device.meta.c4_device_type = deviceType;
                 device.meta.c4_type_confidence = confidence;
                 device.meta.c4_dim_code = dimCode ?? null;
                 device.save();
-                logger.info(`Auto-detected device type: ${deviceType} (${c4.MODEL_NAMES[deviceType] ?? "unknown"}, confidence: ${confidence})`, NS);
+                logger.info(
+                    `Auto-detected device type: ${deviceType} (${model ?? c4.MODEL_NAMES[deviceType] ?? "unknown"}, confidence: ${confidence})`,
+                    NS,
+                );
             } catch (err) {
                 logger.warning(`Auto-detection failed: ${(err as Error).message}`, NS);
                 logger.warning(`Run {"c4_detect": true} to detect device type and read LED colors.`, NS);
-            }
-
-            // The answer also flows through fzControl4Identity, which publishes it.
-            try {
-                const identity = await c4.readC4Identity(device);
-                logger.info(`Identity: ${identity.model ?? "?"} firmware ${identity.firmware ?? "?"}`, NS);
-            } catch (err) {
-                logger.info(`Identity read failed (the periodic report will fill it in): ${(err as Error).message}`, NS);
             }
 
             logger.info(`Device ${device.ieeeAddr} configured.`, NS);
