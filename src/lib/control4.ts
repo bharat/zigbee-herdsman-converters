@@ -489,19 +489,66 @@ export function parseDimmingWriteParam(command: string): string | null {
 
 export type C4DeviceType = "dimmer" | "keypaddim" | "keypad";
 
+/**
+ * Fallback typing from the c4.dmx.dim answer, used only while the model is
+ * unknown. The code reflects the load's configured phase rather than the
+ * hardware, so it guesses wrong in practice: a C4-KD120 set to forward phase
+ * answers 01 and an APD120 set to reverse phase answers 02.
+ */
 export const DIM_TYPE_MAP: Record<string, C4DeviceType> = {
-    "01": "dimmer", // C4-APD120 (forward-phase, 2 buttons)
-    "02": "keypaddim", // C4-KD120  (reverse-phase, 6 buttons + load)
+    "01": "dimmer", // forward phase, usually a C4-APD120 (2 buttons)
+    "02": "keypaddim", // reverse phase, usually a C4-KD120 (6 buttons + load)
 };
+
+/**
+ * Device type fixed by the model the device reports (see readC4Identity).
+ * A listed model wins over the dim code and over self-heal evidence. Models
+ * not listed, such as the C4-SW120277 relay, keep the dim-code detection and
+ * self-heal; the C4-V-ROSW120 outlet has its own definition and no type.
+ */
+export const C4_MODEL_TYPES: Record<string, C4DeviceType> = {
+    "C4-APD120": "dimmer",
+    "C4-KD120": "keypaddim",
+    "C4-KC120277": "keypad",
+};
+
+/** The device type a model fixes, or undefined for an unlisted (or inherited property) name. */
+export function modelDeviceType(model: unknown): C4DeviceType | undefined {
+    return typeof model === "string" && Object.hasOwn(C4_MODEL_TYPES, model) ? C4_MODEL_TYPES[model] : undefined;
+}
+
+export interface C4ModelType {
+    model: string;
+    type: C4DeviceType;
+}
+
+/**
+ * The type fixed by the device's reported model, or undefined while the model
+ * is unknown or names no fixed type. The model is the one applyC4Identity
+ * stored in meta, else the published c4_model, else a modelID it rewrote.
+ */
+export function c4ModelType(device: Zh.Device | undefined, state?: KeyValue): C4ModelType | undefined {
+    const modelID = device?.modelID;
+    const identityModelID = typeof modelID === "string" && Object.hasOwn(C4_IDENTITY_MODELS, modelID) ? modelID : undefined;
+    const model = (device?.meta.c4_model as string | undefined) ?? (state?.c4_model as string | undefined) ?? identityModelID;
+    const type = modelDeviceType(model);
+    return type && model ? {model, type} : undefined;
+}
+
+/**
+ * The device type a dim code maps to, or undefined for an unlisted code. The
+ * code comes from the device, so only own keys count: "constructor" or
+ * "__proto__" must not resolve to an inherited property.
+ */
+export function dimCodeType(dimCode: string): C4DeviceType | undefined {
+    return Object.hasOwn(DIM_TYPE_MAP, dimCode) ? DIM_TYPE_MAP[dimCode] : undefined;
+}
 
 /** Determine device type from c4.dmx.dim response text: any dim code means a load, no response means keypad. */
 export function classifyDeviceType(dimResponseText?: string | null): C4DeviceType {
     const dimType = parseDimResponse(dimResponseText);
-    if (dimType && DIM_TYPE_MAP[dimType]) {
-        return DIM_TYPE_MAP[dimType];
-    }
     if (dimType) {
-        return "keypaddim";
+        return dimCodeType(dimType) ?? "keypaddim";
     }
     return "keypad";
 }
@@ -563,7 +610,7 @@ export interface C4HealEvidence {
  */
 export function healTypeFromEvidence(currentType: string | undefined | null, evidence: C4HealEvidence): C4DeviceType | null {
     if (evidence && evidence.dimCode != null) {
-        const healed = DIM_TYPE_MAP[evidence.dimCode] ?? "keypaddim";
+        const healed = dimCodeType(evidence.dimCode) ?? "keypaddim";
         return healed !== currentType ? healed : null;
     }
     if (evidence && (evidence.ls || evidence.paddle)) {
@@ -682,9 +729,15 @@ export interface C4Detection {
     deviceType: C4DeviceType;
     dimCode: string | null;
     confidence: string;
+    /** Set when the type came from the device's reported model rather than the dim code. */
+    model?: string;
 }
 
-/** Identify the device type with a single c4.dmx.dim query: "01" → dimmer, "02" → keypaddim, error/no answer → keypad. */
+/**
+ * Identify the device type. A known model (C4_MODEL_TYPES) decides it;
+ * otherwise a single c4.dmx.dim query does: "01" → dimmer, "02" → keypaddim,
+ * error/no answer → keypad. The dim code is read and returned either way.
+ */
 export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> {
     logger.info(`Probing device ${device.ieeeAddr}...`, NS);
 
@@ -692,6 +745,13 @@ export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> 
     logger.info(`c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
 
     const dimCode = parseDimResponse(dimResp);
+
+    const typed = c4ModelType(device);
+    if (typed) {
+        logger.info(`Device type: ${typed.type} (reported model ${typed.model})`, NS);
+        return {deviceType: typed.type, dimCode, confidence: C4_CONFIDENCE_CONFIRMED, model: typed.model};
+    }
+
     const deviceType = classifyDeviceType(dimResp);
 
     // A dim answer proves the load type; a no-answer keypad verdict may be a
@@ -959,6 +1019,10 @@ export function applyC4Heal(
 ): KeyValue | null {
     if (!device) return null;
 
+    // A known model fixes the type: evidence can't move the device away from
+    // it, only bring a stale stored type back to it.
+    if (c4ModelType(device)) return applyC4ModelType(device, {c4_device_type: currentType}, publish) ?? null;
+
     const newType = healTypeFromEvidence(currentType, evidence);
     if (!newType) return null;
 
@@ -996,6 +1060,50 @@ export function applyC4Heal(
 
     if (publish) publish(state);
     return state;
+}
+
+/**
+ * Type a device from its reported model (C4_MODEL_TYPES) and return the state
+ * fragment to publish, or undefined when nothing needs correcting. Corrects
+ * the stored type and confidence when they disagree with the model, and the
+ * published type when `state` carries a different c4_device_type, so a device
+ * typed wrongly before its model was known is fixed without a re-pair.
+ * Idempotent, so the identity report (about once a minute) can call it freely.
+ */
+export function applyC4ModelType(device: Zh.Device | undefined, state?: KeyValue, publish?: Publish): KeyValue | undefined {
+    if (!device) return undefined;
+    const typed = c4ModelType(device, state);
+    if (!typed) return undefined;
+    const {model, type} = typed;
+
+    const metaCurrent = device.meta.c4_device_type === type && device.meta.c4_type_confidence === C4_CONFIDENCE_CONFIRMED;
+    const publishedType = state?.c4_device_type as string | undefined | null;
+    const publishedStale = publishedType != null && publishedType !== type;
+    if (metaCurrent && !publishedStale) return undefined;
+
+    const previous = publishedType ?? (device.meta.c4_device_type as string | undefined);
+    if (!metaCurrent) {
+        logger.info(`${device.ieeeAddr}: ${previous ?? "(none)"} -> ${type} (reported model ${model})`, NS);
+        persistC4Meta(device, {type, confidence: C4_CONFIDENCE_CONFIRMED});
+    }
+    stopC4ProbeCampaign(device);
+
+    const result: KeyValue = {
+        c4_device_type: type,
+        c4_detect_result: {
+            ieee_address: device.ieeeAddr,
+            device_type: type,
+            confidence: C4_CONFIDENCE_CONFIRMED,
+            dim_code: (device.meta.c4_dim_code as string | null | undefined) ?? null,
+            model,
+            description: MODEL_DESCRIPTIONS[type],
+            healed: previous != null && previous !== type,
+            evidence: `reported model ${model}`,
+        },
+    };
+
+    if (publish) publish(result);
+    return result;
 }
 
 function markConfirmedC4Keypad(device: Zh.Device, publish?: Publish, opts: {evidence?: string; logReason?: string} = {}): void {
@@ -1049,6 +1157,7 @@ export function scheduleC4ProbeCampaign(
 ): void {
     if (!device) return;
     if (deviceType !== "keypad") return;
+    if (c4ModelType(device)) return; // The model decides the type; probing can't change it.
     if (effectiveConfidence(device.meta) === C4_CONFIDENCE_CONFIRMED) return;
     if (c4ProbeCampaigns.has(device.ieeeAddr)) return;
 
@@ -1069,6 +1178,14 @@ export function scheduleC4ProbeCampaign(
         } catch (err) {
             logger.warning(`Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
             outcome = {kind: "silent"};
+        }
+
+        // The model may have become known since the campaign started; once
+        // it is, it decides the type and the probe answer no longer matters.
+        if (c4ModelType(device)) {
+            applyC4ModelType(device, {c4_device_type: deviceType}, publish);
+            c4ProbeCampaigns.delete(device.ieeeAddr);
+            return;
         }
 
         if (outcome.kind === "heal") {
@@ -1108,10 +1225,18 @@ export function scheduleC4ProbeCampaign(
 /**
  * Arm the self-heal probe campaign at bridge start, so quiet devices get probed
  * without having to emit traffic first; an absent classification counts as an
- * assumed keypad so a never-detected device is still probed.
+ * assumed keypad so a never-detected device is still probed. A device whose
+ * model is known is never probed; a stored type its model contradicts is
+ * corrected here, and the corrected type is published by the next identity
+ * report or C4 message from the device.
  */
 export function c4ArmProbeOnStart(device: Zh.Device | undefined, state: KeyValue | undefined, opts: C4ProbeCampaignOpts = {}): void {
     if (!device) return;
+
+    if (c4ModelType(device, state)) {
+        applyC4ModelType(device, state, opts.publish);
+        return;
+    }
 
     const currentType = (state?.c4_device_type as string | undefined) ?? (device.meta.c4_device_type as string | undefined) ?? "keypad";
     scheduleC4ProbeCampaign(device, currentType, opts.publish, opts);

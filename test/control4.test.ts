@@ -18,6 +18,7 @@ import {
     C4_MIB_PROFILE,
     classifyDeviceType,
     DIM_TYPE_MAP,
+    dimCodeType,
     formatGetCommand,
     formatSetCommand,
     GENBASIC_ATTRS,
@@ -709,6 +710,14 @@ describe("Control4 protocol", () => {
         it("returns keypaddim for unknown dim type (future-proofing)", () => {
             expect(classifyDeviceType("0r0001 000 c4.dmx.dim 03")).toBe("keypaddim");
         });
+
+        it.each(["constructor", "__proto__", "toString", "hasOwnProperty"])(
+            "files the inherited property name %s under keypaddim, like any unlisted code",
+            (code) => {
+                expect(dimCodeType(code)).toBeUndefined();
+                expect(classifyDeviceType(`0r0001 000 c4.dmx.dim ${code}`)).toBe("keypaddim");
+            },
+        );
     });
 
     describe("getButtonsForDeviceType", () => {
