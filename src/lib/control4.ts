@@ -47,6 +47,7 @@ export const C4_ATTR_MODEL = 0x0007;
  */
 export const C4_IDENTITY_MODELS: Record<string, string> = {
     "C4-APD120": "Adaptive phase dimmer",
+    "C4-FPD120": "Forward phase dimmer",
     "C4-KD120": "Keypad dimmer",
     "C4-KC120277": "Configurable keypad",
     "C4-SW120277": "Switch",
@@ -508,6 +509,7 @@ export const DIM_TYPE_MAP: Record<string, C4DeviceType> = {
  */
 export const C4_MODEL_TYPES: Record<string, C4DeviceType> = {
     "C4-APD120": "dimmer",
+    "C4-FPD120": "dimmer",
     "C4-KD120": "keypaddim",
     "C4-KC120277": "keypad",
 };

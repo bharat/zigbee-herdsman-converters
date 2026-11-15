@@ -1261,6 +1261,7 @@ describe("Control4 glue", () => {
 
         it.each([
             ["C4-APD120", "dimmer"],
+            ["C4-FPD120", "dimmer"],
             ["C4-KD120", "keypaddim"],
             ["C4-KC120277", "keypad"],
         ])("types a %s as %s", (model, type) => {
@@ -1498,6 +1499,45 @@ describe("Control4 glue", () => {
             expect(device.meta.c4_device_type).toBe("dimmer");
         });
 
+        it("a C4-FPD120 identity report rewrites the placeholder modelID and types it dimmer", async () => {
+            // The owner's "Steps": a C4-FPD120 typed keypaddim from its dim code while the model was unlisted.
+            const meta = {c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED, c4_dim_code: "02"};
+            const {device} = makeDevice("0x102c", meta);
+            Object.assign(device, {modelID: "C4-Zigbee"});
+
+            const result = await identityReport(device, "C4-FPD120", {c4_device_type: "keypaddim"});
+
+            expect(result).toEqual(
+                expect.objectContaining({
+                    c4_model: "C4-FPD120",
+                    c4_device_type: "dimmer",
+                    c4_detect_result: expect.objectContaining({
+                        device_type: "dimmer",
+                        model: "C4-FPD120",
+                        healed: true,
+                        evidence: "reported model C4-FPD120",
+                    }),
+                }),
+            );
+            expect((device as unknown as Zh.Device).modelID).toBe("C4-FPD120");
+            expect(device.meta.c4_model).toBe("C4-FPD120");
+            expect(device.meta.c4_device_type).toBe("dimmer");
+            expect(device.meta.c4_type_confidence).toBe(C4_CONFIDENCE_CONFIRMED);
+            expect(device.save).toHaveBeenCalled();
+        });
+
+        it("corrects a stored keypaddim on a C4-FPD120 to dimmer at startup without probing", async () => {
+            const {device} = makeDevice("0x102d", {c4_model: "C4-FPD120", c4_device_type: "keypaddim", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+            Object.assign(device, {modelID: "C4-FPD120"});
+            const probeFn = vi.fn(async () => null);
+
+            c4ArmProbeOnStart(asDevice(device), {c4_device_type: "keypaddim"}, {probeFn, random: () => 0});
+            await vi.advanceTimersByTimeAsync(120000);
+
+            expect(device.meta.c4_device_type).toBe("dimmer");
+            expect(probeFn).not.toHaveBeenCalled();
+        });
+
         it("a C4-SW120277 keeps today's typing: dim-code heal, and no type from its identity report", async () => {
             const {device} = makeDevice("0x102a", {c4_model: "C4-SW120277", c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
             Object.assign(device, {modelID: "C4-SW120277"});
@@ -1621,7 +1661,7 @@ describe("Control4 glue", () => {
         });
 
         it("whiteLabels every identity model and lists it as a zigbeeModel", () => {
-            const models = ["C4-APD120", "C4-KD120", "C4-KC120277", "C4-SW120277"];
+            const models = ["C4-APD120", "C4-FPD120", "C4-KD120", "C4-KC120277", "C4-SW120277"];
             expect((definition.whiteLabel ?? []).map((w) => w.model)).toEqual(models);
             for (const model of models) {
                 expect(definition.zigbeeModel).toContain(model);
