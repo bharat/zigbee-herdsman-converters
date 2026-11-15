@@ -494,14 +494,20 @@ export const DIM_TYPE_MAP: Record<string, C4DeviceType> = {
     "02": "keypaddim", // C4-KD120  (reverse-phase, 6 buttons + load)
 };
 
+/**
+ * The device type a dim code maps to, or undefined for an unlisted code. The
+ * code comes from the device, so only own keys count: "constructor" or
+ * "__proto__" must not resolve to an inherited property.
+ */
+export function dimCodeType(dimCode: string): C4DeviceType | undefined {
+    return Object.hasOwn(DIM_TYPE_MAP, dimCode) ? DIM_TYPE_MAP[dimCode] : undefined;
+}
+
 /** Determine device type from c4.dmx.dim response text: any dim code means a load, no response means keypad. */
 export function classifyDeviceType(dimResponseText?: string | null): C4DeviceType {
     const dimType = parseDimResponse(dimResponseText);
-    if (dimType && DIM_TYPE_MAP[dimType]) {
-        return DIM_TYPE_MAP[dimType];
-    }
     if (dimType) {
-        return "keypaddim";
+        return dimCodeType(dimType) ?? "keypaddim";
     }
     return "keypad";
 }
@@ -563,7 +569,7 @@ export interface C4HealEvidence {
  */
 export function healTypeFromEvidence(currentType: string | undefined | null, evidence: C4HealEvidence): C4DeviceType | null {
     if (evidence && evidence.dimCode != null) {
-        const healed = DIM_TYPE_MAP[evidence.dimCode] ?? "keypaddim";
+        const healed = dimCodeType(evidence.dimCode) ?? "keypaddim";
         return healed !== currentType ? healed : null;
     }
     if (evidence && (evidence.ls || evidence.paddle)) {

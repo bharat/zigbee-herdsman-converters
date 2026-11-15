@@ -145,6 +145,22 @@ describe("Control4 glue", () => {
         it("empty (non-load) evidence never reclassifies", () => {
             expect(healTypeFromEvidence("keypad", {})).toBeNull();
         });
+
+        it.each(["constructor", "__proto__", "toString"])(
+            "heals an inherited property name %s as an unlisted code, never to an inherited value",
+            (code) => {
+                expect(healTypeFromEvidence("keypad", {dimCode: code})).toBe("keypaddim");
+            },
+        );
+
+        it("stores a plain type string when a dim answer names an inherited property", () => {
+            const {device} = makeDevice("0x0A0C", {c4_device_type: "keypad", c4_type_confidence: C4_CONFIDENCE_ASSUMED});
+
+            const state = applyC4Heal(asDevice(device), "keypad", {dimCode: "constructor"}, vi.fn());
+
+            expect(state?.c4_device_type).toBe("keypaddim");
+            expect(device.meta.c4_device_type).toBe("keypaddim");
+        });
     });
 
     describe("classifyDimProbeResponse / isC4DimNegativeResponse", () => {
