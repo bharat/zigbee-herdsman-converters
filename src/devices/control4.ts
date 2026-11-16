@@ -147,59 +147,71 @@ const fzControl4Identity = {
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["attributeReport", "readResponse"]>;
 
+/**
+ * Resolve a c4_led LED or mode given by name (an own key of `table`) or as a
+ * raw wire code, and return the code, which must be 00-05. Anything else
+ * throws, so no text beyond a two-digit code reaches the command.
+ */
+function c4LedCode(table: Record<string, string>, value: unknown, what: string): string {
+    if (typeof value !== "string" && typeof value !== "number") throw new Error(`Invalid ${what}: expected a name or a 2-digit code`);
+    const name = String(value);
+    const code = Object.hasOwn(table, name) ? table[name] : name;
+    if (!/^0[0-5]$/.test(code)) throw new Error(`Invalid ${what} ${c4.c4LogText(name)}: expected one of ${Object.keys(table).join(", ")} or 00-05`);
+    return code;
+}
+
+/** Normalize and validate a c4_led color, throwing on anything but 6 hex digits. */
+function c4LedColor(color: unknown): string {
+    const colorHex = typeof color === "string" || typeof color === "number" ? c4.normalizeColorHex(String(color)) : "";
+    if (!c4.isValidColorHex(colorHex)) {
+        throw new Error(`Invalid color ${c4.c4LogText(String(color))}, expected 6-digit hex RGB like "ff0000"`);
+    }
+    return colorHex;
+}
+
 // Set LED colors, single ({"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}})
 // or batch ({"c4_led": {"top_on": "ffffff", "bottom_off": "0000ff", ...}}).
 const tzControl4Led = {
     key: ["c4_led"],
     convertSet: async (entity, key, value, meta) => {
         if (!meta.device) throw new Error("c4_led requires a device");
-        const val = value as KeyValue;
+        const val = (value ?? {}) as KeyValue;
         const state: KeyValue = {};
 
         if (val.top_on !== undefined || val.top_off !== undefined || val.bottom_on !== undefined || val.bottom_off !== undefined) {
-            const commands: [string, string, unknown][] = [
-                ["01", "03", val.top_on],
-                ["01", "04", val.top_off],
-                ["04", "03", val.bottom_on],
-                ["04", "04", val.bottom_off],
+            const commands: [string, string, unknown, string][] = [
+                ["01", "03", val.top_on, "c4_top_led_on"],
+                ["01", "04", val.top_off, "c4_top_led_off"],
+                ["04", "03", val.bottom_on, "c4_bottom_led_on"],
+                ["04", "04", val.bottom_off, "c4_bottom_led_off"],
             ];
 
-            for (const [ledId, mode, color] of commands) {
-                if (color === undefined) continue;
-                const colorHex = c4.normalizeColorHex(String(color));
-                if (!c4.isValidColorHex(colorHex)) {
-                    throw new Error(`Invalid color "${color}", expected 6-digit hex RGB`);
-                }
+            // Validate every color before sending any, so a bad one leaves the LEDs untouched.
+            const valid = commands
+                .filter(([, , color]) => color !== undefined)
+                .map(([ledId, mode, color, stateKey]) => [ledId, mode, c4LedColor(color), stateKey]);
+            for (const [ledId, mode, colorHex, stateKey] of valid) {
                 await c4.sendC4(meta.device, `c4.dmx.led ${ledId} ${mode} ${colorHex}`);
+                state[stateKey] = colorHex;
             }
-
-            if (val.top_on) state.c4_top_led_on = val.top_on;
-            if (val.top_off) state.c4_top_led_off = val.top_off;
-            if (val.bottom_on) state.c4_bottom_led_on = val.bottom_on;
-            if (val.bottom_off) state.c4_bottom_led_off = val.bottom_off;
 
             return {state};
         }
 
-        const led = (val.led as string | undefined) ?? "top";
-        const color = val.color as string | undefined;
-        const mode = (val.mode as string | undefined) ?? "on";
+        const led = val.led ?? "top";
+        const mode = val.mode ?? "on";
 
-        if (!color) {
+        if (!val.color) {
             throw new Error('c4_led requires "color" (6-digit hex RGB) or batch keys (top_on, top_off, etc.)');
         }
 
-        const ledId = c4.LED_IDS[led] ?? led;
-        const colorHex = c4.normalizeColorHex(color);
-
-        if (!c4.isValidColorHex(colorHex)) {
-            throw new Error(`Invalid color "${color}", expected 6-digit hex RGB like "ff0000"`);
-        }
-
-        const modeCode = c4.LED_MODES[mode] ?? mode;
+        const ledId = c4LedCode(c4.LED_IDS, led, "LED");
+        const modeCode = c4LedCode(c4.LED_MODES, mode, "LED mode");
+        const colorHex = c4LedColor(val.color);
 
         await c4.sendC4(meta.device, `c4.dmx.led ${ledId} ${modeCode} ${colorHex}`);
-        state[`c4_led_${led}_${mode}`] = colorHex;
+        // Both parts passed c4LedCode: a known name or a 00-05 code.
+        state[`c4_led_${String(led)}_${String(mode)}`] = colorHex;
 
         return {state};
     },

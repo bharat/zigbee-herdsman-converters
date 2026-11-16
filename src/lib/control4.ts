@@ -799,7 +799,23 @@ export const GENBASIC_ATTRS: readonly string[] = [
 
 // Everything below performs I/O against the device via Endpoint.sendRaw.
 
+/**
+ * True when a frame body is printable ASCII (0x20-0x7E) only. The check is on
+ * code points: Buffer.from(text, "ascii") keeps only the low byte of each one,
+ * so a character such as U+010A would otherwise go out as a bare LF and end
+ * the frame early, letting the rest smuggle in a second command.
+ */
+export function isPrintableC4Text(text: string): boolean {
+    return /^[\x20-\x7e]*$/.test(text);
+}
+
 export async function sendC4Raw(device: Zh.Device, text: string): Promise<string> {
+    // The only control characters a frame may hold are its own CRLF terminator.
+    const body = text.endsWith("\r\n") ? text.slice(0, -2) : text;
+    if (!isPrintableC4Text(body)) {
+        throw new Error(`C4 command text must be printable ASCII (0x20-0x7E), got ${c4LogText(body)}`);
+    }
+
     const ep = device.getEndpoint(1);
     if (!ep) throw new Error("Endpoint 1 not found on device");
 

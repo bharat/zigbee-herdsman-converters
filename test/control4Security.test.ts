@@ -50,6 +50,21 @@ const definition = definitions[0];
 const outlet = definitions[1];
 const [rawFz, identityFz] = definition.fromZigbee as unknown as [{convert: AnyFn}, {convert: AnyFn}];
 
+function tz(key: string): AnyFn {
+    const converter = (definition.toZigbee ?? []).find((t) => t.key?.includes(key));
+    if (!converter?.convertSet) throw new Error(`no converter for ${key}`);
+    return converter.convertSet as AnyFn;
+}
+
+function tzMeta(device: MockDevice): KeyValue {
+    return {device: asDevice(device), publish: vi.fn(), state: {}, message: {}};
+}
+
+/** Frame bodies put on the air, without the "0s<seq> " / "0g<seq> " prefix and CRLF. */
+function bodies(sent: string[]): string[] {
+    return sent.map((frame) => frame.replace(/^0[sg][0-9a-f]{4} /, "").replace(/\r\n$/, ""));
+}
+
 function raw(text: string, device: MockDevice, state: KeyValue = {}, publish: AnyFn = vi.fn()): Promise<KeyValue | undefined> {
     const msg = {data: Buffer.from(text, "latin1"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
     return rawFz.convert(definition, msg, publish, {}, {state, device});
@@ -495,6 +510,92 @@ describe("Control4 security hardening", () => {
             await vi.advanceTimersByTimeAsync(c4.C4_FRAME_WARN_INTERVAL_MS);
             await raw("0t0001 sa c4.dmx.ls 00 00 65", device);
             expect(warnings()).toHaveLength(3);
+        });
+    });
+
+    describe("c4_led and raw command validation", () => {
+        const ch = (code: number) => String.fromCharCode(code);
+
+        it("sends and publishes legitimate single LED commands unchanged", async () => {
+            const {device, sent} = makeDevice("0x5E71");
+            const led = tz("c4_led");
+
+            expect(await led(undefined, "c4_led", {led: "top", color: "FF0000", mode: "on"}, tzMeta(device))).toEqual({
+                state: {c4_led_top_on: "ff0000"},
+            });
+            expect(await led(undefined, "c4_led", {led: 3, color: "#00ff00", mode: "off"}, tzMeta(device))).toEqual({
+                state: {c4_led_3_off: "00ff00"},
+            });
+            expect(await led(undefined, "c4_led", {led: "02", color: "0000ff", mode: "05"}, tzMeta(device))).toEqual({
+                state: {c4_led_02_05: "0000ff"},
+            });
+            expect(await led(undefined, "c4_led", {color: "ffffff"}, tzMeta(device))).toEqual({state: {c4_led_top_on: "ffffff"}});
+
+            expect(bodies(sent)).toEqual([
+                "c4.dmx.led 01 03 ff0000",
+                "c4.dmx.led 02 04 00ff00",
+                "c4.dmx.led 02 05 0000ff",
+                "c4.dmx.led 01 03 ffffff",
+            ]);
+        });
+
+        it.each([
+            ["a smuggled frame", {led: "01 03 ff0000\r\n0s0001 c4.dmx.btn 01 01 00\r\n0s0002 c4.dmx.led 01"}],
+            ["__proto__", {led: "__proto__"}],
+            ["constructor", {led: "constructor"}],
+            ["toString", {mode: "toString"}],
+            ["an out-of-range code", {led: "06"}],
+            ["a long code", {mode: "003"}],
+            ["an object", {led: {x: 1}}],
+        ])("rejects %s as an LED or mode and sends nothing", async (_label, fields) => {
+            const {device, sent} = makeDevice("0x5E72");
+            await expect(tz("c4_led")(undefined, "c4_led", {color: "00ff00", ...fields}, tzMeta(device))).rejects.toThrow(/Invalid LED/);
+            expect(sent).toEqual([]);
+        });
+
+        it("rejects a non-hex color", async () => {
+            const {device, sent} = makeDevice("0x5E73");
+            await expect(tz("c4_led")(undefined, "c4_led", {color: "zzzzzz"}, tzMeta(device))).rejects.toThrow(/Invalid color/);
+            await expect(tz("c4_led")(undefined, "c4_led", {color: {r: 1}}, tzMeta(device))).rejects.toThrow(/Invalid color/);
+            expect(sent).toEqual([]);
+        });
+
+        it("batch form publishes the validated colors and sends nothing if any is bad", async () => {
+            const {device, sent} = makeDevice("0x5E74");
+            const led = tz("c4_led");
+
+            expect(await led(undefined, "c4_led", {top_on: "#FFFFFF", bottom_off: "0000ff"}, tzMeta(device))).toEqual({
+                state: {c4_top_led_on: "ffffff", c4_bottom_led_off: "0000ff"},
+            });
+            expect(bodies(sent)).toEqual(["c4.dmx.led 01 03 ffffff", "c4.dmx.led 04 04 0000ff"]);
+
+            sent.length = 0;
+            await expect(led(undefined, "c4_led", {top_on: "ffffff", bottom_on: "ff0000\r\n0s0001 x"}, tzMeta(device))).rejects.toThrow(
+                /Invalid color/,
+            );
+            expect(sent).toEqual([]);
+        });
+
+        it.each([
+            ["CRLF", "c4.dmx.led 01 03 ff0000\r\n0s0001 c4.dmx.btn 01 01 00"],
+            ["a bare LF", "c4.dmx.led 01 03 ff0000\n"],
+            ["NUL", `c4.dmx.led${ch(0)}`],
+            ["DEL", `c4.dmx.led${ch(0x7f)}`],
+            ["U+010A, which the ascii encoder turns into LF", `c4.dmx.led 01 03 ff0000${ch(0x10a)}0s0001 c4.dmx.btn 01 01 00`],
+            ["U+010D, which the ascii encoder turns into CR", `c4.dmx.led 01 03 ff0000${ch(0x10d)}`],
+            ["a non-ASCII letter", `c4.dmx.l${ch(0xe9)}d`],
+        ])("c4_cmd and c4_query reject text with %s", async (_label, text) => {
+            const {device, sent} = makeDevice("0x5E75");
+            await expect(tz("c4_cmd")(undefined, "c4_cmd", text, tzMeta(device))).rejects.toThrow(/printable ASCII/);
+            await expect(tz("c4_query")(undefined, "c4_query", text, tzMeta(device))).rejects.toThrow(/printable ASCII/);
+            expect(sent).toEqual([]);
+        });
+
+        it("c4_cmd still sends a plain command with its CRLF terminator", async () => {
+            const {device, sent} = makeDevice("0x5E76");
+            await tz("c4_cmd")(undefined, "c4_cmd", "c4.dmx.led 01 03 ff0000", tzMeta(device));
+            expect(sent).toHaveLength(1);
+            expect(sent[0]).toMatch(/^0s[0-9a-f]{4} c4\.dmx\.led 01 03 ff0000\r\n$/);
         });
     });
 });
