@@ -502,8 +502,40 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     return null;
 }
 
+/** Longest device text a log line quotes before truncating it. */
+const C4_LOG_TEXT_MAX = 200;
+
+/**
+ * Quote device-supplied text for a log line. JSON string escaping turns CR,
+ * LF, ESC and the other control characters into visible escapes, so a frame
+ * can't forge log lines or drive a terminal; anything else outside printable
+ * ASCII (DEL, C1 controls, Unicode line separators) is escaped as well.
+ */
+export function c4LogText(text: string): string {
+    const clipped = text.length > C4_LOG_TEXT_MAX ? `${text.slice(0, C4_LOG_TEXT_MAX)}...` : text;
+    return JSON.stringify(clipped).replace(/[^\x20-\x7e]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** Minimum time between two malformed-frame warnings for one device. */
+export const C4_FRAME_WARN_INTERVAL_MS = 60 * 1000;
+
+const c4LastFrameWarning = new Map<string, number>();
+
+/** Warn about a device's frame at most once per C4_FRAME_WARN_INTERVAL_MS per device; debug otherwise. */
+function warnC4Frame(ieeeAddr: string | undefined, message: string): void {
+    const key = ieeeAddr ?? "?";
+    const now = Date.now();
+    const last = c4LastFrameWarning.get(key);
+    if (last !== undefined && now - last < C4_FRAME_WARN_INTERVAL_MS) {
+        logger.debug(message, NS);
+        return;
+    }
+    c4LastFrameWarning.set(key, now);
+    logger.warning(message, NS);
+}
+
 /** Parse load telemetry as a hex percent (0x00-0x64): dmx "c4.dmx.ls" (third data field) or legacy "c4.dm.t0c <level>". */
-export function parseLoadStatus(text: string): {level: number} | null {
+export function parseLoadStatus(text: string, ieeeAddr?: string): {level: number} | null {
     // dmx telemetry: the third data field is the level. Legacy "c4.dm." dimmers
     // (C4-DIM1-Z) instead report each ramp step as "c4.dm.t0c <level>".
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls \w+ \w+ (\w+)/) ?? text.match(/^0t\w+ sa c4\.dm\.t0c (\w+)/);
@@ -511,7 +543,7 @@ export function parseLoadStatus(text: string): {level: number} | null {
 
     const level = Number.parseInt(match[1], 16);
     if (Number.isNaN(level) || level > 0x64) {
-        logger.warning(`Ignoring out-of-range load level: ${text}`, NS);
+        warnC4Frame(ieeeAddr, `${ieeeAddr ?? "?"}: ignoring out-of-range load level: ${c4LogText(text)}`);
         return null;
     }
 
@@ -858,7 +890,7 @@ export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, ti
         };
 
         const timer = setTimeout(() => {
-            logger.warning(`Timeout for seq ${seq}: ${cmdBody}`, NS);
+            logger.warning(`Timeout for seq ${seq}: ${c4LogText(cmdBody)}`, NS);
             settle(null);
         }, timeoutMs);
 
@@ -888,7 +920,7 @@ export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> 
     logger.info(`Probing device ${device.ieeeAddr}...`, NS);
 
     const dimResp = await queryC4WithResponse(device, "c4.dmx.dim", 3000);
-    logger.info(`c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
+    logger.info(`c4.dmx.dim response: ${dimResp ? c4LogText(dimResp) : "(timeout)"}`, NS);
 
     const dimCode = parseDimResponse(dimResp);
 
@@ -1200,6 +1232,7 @@ export function clearC4DeviceState(ieeeAddr: string): void {
     c4LoadStateTimers.delete(ieeeAddr);
 
     c4LastLsSeen.delete(ieeeAddr);
+    c4LastFrameWarning.delete(ieeeAddr);
     c4LastIdentityPersist.delete(ieeeAddr);
     c4LastDimHealPersist.delete(ieeeAddr);
     abandonC4PendingQueries(ieeeAddr);
@@ -1215,6 +1248,7 @@ export function resetC4HealState(): void {
     c4LastIdentityPersist.clear();
     c4LastDimHealPersist.clear();
     loggedModelConflicts.clear();
+    c4LastFrameWarning.clear();
 }
 
 /**

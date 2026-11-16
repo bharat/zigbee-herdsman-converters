@@ -39,7 +39,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
             if (!text) return;
 
             const epId = msg.endpoint?.ID ?? "?";
-            logger.debug(`Received EP ${epId}: ${text}`, NS);
+            logger.debug(`Received EP ${epId}: ${c4.c4LogText(text)}`, NS);
 
             const respSeq = c4.parseResponseSeq(text);
             if (respSeq && c4.resolveC4PendingQuery(respSeq, text, msg.device?.ieeeAddr)) {
@@ -99,7 +99,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
                 return result;
             }
 
-            const loadStatus = c4.parseLoadStatus(text);
+            const loadStatus = c4.parseLoadStatus(text, msg.device?.ieeeAddr);
             if (loadStatus) {
                 logger.debug(`${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
 
@@ -239,7 +239,7 @@ const tzControl4Query = {
         }
 
         const sent = await c4.queryC4(meta.device, value);
-        logger.debug(`Query sent: ${sent}`, NS);
+        logger.debug(`Query sent: ${c4.c4LogText(sent)}`, NS);
         return {state: {c4_last_query: sent}};
     },
 } satisfies Tz.Converter;
@@ -499,7 +499,7 @@ export const definitions: DefinitionWithExtend[] = [
             try {
                 const identity = await c4.readC4Identity(device);
                 c4.applyC4Identity(device, identity, undefined);
-                logger.info(`Identity: ${identity.model ?? "?"} firmware ${identity.firmware ?? "?"}`, NS);
+                logger.info(`Identity: ${c4.c4LogText(identity.model ?? "?")} firmware ${c4.c4LogText(identity.firmware ?? "?")}`, NS);
             } catch (err) {
                 logger.info(`Identity read failed (the periodic report will fill it in): ${(err as Error).message}`, NS);
             }

@@ -447,4 +447,54 @@ describe("Control4 security hardening", () => {
             expect(logger.warning).not.toHaveBeenCalledWith(expect.stringContaining("Timeout"), "zhc:control4");
         });
     });
+
+    describe("logging device text", () => {
+        const ch = (code: number) => String.fromCharCode(code);
+        // LF, ESC, CR, DEL, a C1 control and LINE SEPARATOR.
+        const hostile = `0t1 sa c4.dmx.ls 0 0 65${ch(0x0a)}[fake log line]${ch(0x1b)}[2J${ch(0x0d)}${ch(0x7f)}${ch(0x85)}${ch(0x2028)}`;
+
+        /** True when every character is printable ASCII. */
+        const printable = (s: string) => [...s].every((c) => c.charCodeAt(0) >= 0x20 && c.charCodeAt(0) <= 0x7e);
+
+        /** Every message passed to a logger mock, joined. */
+        function logged(fn: unknown): string {
+            return vi
+                .mocked(fn as AnyFn)
+                .mock.calls.map((args: unknown[]) => String(args[0]))
+                .join("|");
+        }
+
+        it("c4LogText escapes control characters and clips long text", () => {
+            const escaped = c4.c4LogText(hostile);
+            expect(printable(escaped)).toBe(true);
+            expect(escaped).toContain("[fake log line]");
+            expect(escaped).toContain("\\n[fake log line]");
+            expect(escaped).toContain("\\u001b[2J\\r\\u007f\\u0085\\u2028");
+            expect(c4.c4LogText("x".repeat(1000)).length).toBeLessThan(220);
+        });
+
+        it("no raw control character reaches a log line from a hostile frame", async () => {
+            const {device} = makeDevice("0x5E61", {c4_device_type: "keypaddim", c4_type_confidence: "confirmed"});
+            await raw(hostile, device);
+            const all = logged(logger.debug) + logged(logger.info) + logged(logger.warning);
+            expect(all).toContain("[fake log line]");
+            expect(printable(all)).toBe(true);
+        });
+
+        it("rate-limits the malformed-frame warning per device", async () => {
+            const {device} = makeDevice("0x5E62", {c4_device_type: "keypaddim", c4_type_confidence: "confirmed"});
+            const {device: other} = makeDevice("0x5E63", {c4_device_type: "keypaddim", c4_type_confidence: "confirmed"});
+            const warnings = () => vi.mocked(logger.warning).mock.calls.filter((args) => String(args[0]).includes("out-of-range load level"));
+
+            for (let i = 0; i < 50; i++) await raw("0t0001 sa c4.dmx.ls 00 00 65", device);
+            expect(warnings()).toHaveLength(1);
+
+            await raw("0t0001 sa c4.dmx.ls 00 00 65", other);
+            expect(warnings()).toHaveLength(2);
+
+            await vi.advanceTimersByTimeAsync(c4.C4_FRAME_WARN_INTERVAL_MS);
+            await raw("0t0001 sa c4.dmx.ls 00 00 65", device);
+            expect(warnings()).toHaveLength(3);
+        });
+    });
 });
