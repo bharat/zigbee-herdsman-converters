@@ -345,7 +345,8 @@ export function parseResponseSeq(text: string): string | null {
     return match ? match[1] : null;
 }
 
-const loggedUnknownWireIds = new Set<number>();
+// Bounded through c4FirstTime; every malformed id shares one key.
+const loggedUnknownWireIds = new Set<string | number>();
 
 /** Reset the once-per-wire-id unknown-id log guard (for testing). */
 export function resetC4ButtonLogState(): void {
@@ -366,24 +367,33 @@ export interface C4ButtonEvent {
     clickCount?: number;
 }
 
+/** A wire id as the dmx frames carry it: exactly two hex digits. */
+const C4_WIRE_ID = /^[0-9a-fA-F]{2}$/;
+
 /**
  * Map a bp/cc/sc wire id: 0x00-0x05 → button_1..6, 0x07/0x08 → paddle halves.
- * Other ids keep the legacy button_(N+1) mapping but are logged once.
+ * Anything else (another value, or not two hex digits) maps to nothing, so
+ * no action outside ACTION_VALUES is ever published; it is logged once.
  */
 export function resolveButtonTarget(wireIdHex: string): C4ButtonTarget | null {
-    const wireId = Number.parseInt(wireIdHex, 16);
-    if (Number.isNaN(wireId)) return null;
+    const wireId = C4_WIRE_ID.test(wireIdHex) ? Number.parseInt(wireIdHex, 16) : Number.NaN;
 
-    const paddle = PADDLE_WIRE_IDS[wireId];
+    const paddle = Object.hasOwn(PADDLE_WIRE_IDS, wireId) ? PADDLE_WIRE_IDS[wireId] : undefined;
     if (paddle) return {prefix: paddle, paddle};
 
-    if (wireId < 0x00 || wireId > 0x05) {
-        if (!loggedUnknownWireIds.has(wireId)) {
-            loggedUnknownWireIds.add(wireId);
-            logger.warning(`Unknown wire id 0x${wireId.toString(16).padStart(2, "0")}: not a button slot (0x00-0x05) or paddle half (0x07/0x08)`, NS);
-        }
+    if (wireId >= 0x00 && wireId <= 0x05) return {prefix: `button_${wireId + 1}`, buttonId: wireId + 1};
+
+    const known = !Number.isNaN(wireId);
+    if (c4FirstTime(loggedUnknownWireIds, known ? wireId : "malformed")) {
+        const shown = known ? `0x${wireIdHex.toLowerCase()}` : "(malformed)";
+        logger.warning(`Unknown wire id ${shown}: not a button slot (0x00-0x05) or paddle half (0x07/0x08), ignored`, NS);
     }
-    return {prefix: `button_${wireId + 1}`, buttonId: wireId + 1};
+    return null;
+}
+
+/** A click count: one or two hex digits, else null. */
+function parseClickCount(countHex: string): number | null {
+    return /^[0-9a-fA-F]{1,2}$/.test(countHex) ? Number.parseInt(countHex, 16) : null;
 }
 
 function targetIdentity(target: C4ButtonTarget): {paddle: string} | {buttonId: number | undefined} {
@@ -401,9 +411,9 @@ export const LEGACY_DM_PADDLE_IDS: Record<number, string> = {
 };
 
 function resolveLegacyDmTarget(wireIdHex: string): C4ButtonTarget | null {
+    if (!/^[0-9a-fA-F]{1,2}$/.test(wireIdHex)) return null;
     const wireId = Number.parseInt(wireIdHex, 16);
-    if (Number.isNaN(wireId)) return null;
-    const paddle = LEGACY_DM_PADDLE_IDS[wireId];
+    const paddle = Object.hasOwn(LEGACY_DM_PADDLE_IDS, wireId) ? LEGACY_DM_PADDLE_IDS[wireId] : undefined;
     return paddle ? {prefix: paddle, paddle} : null;
 }
 
@@ -425,8 +435,8 @@ function parseLegacyDmButtonEvent(text: string): C4ButtonEvent | null {
     if (ccMatch) {
         const target = resolveLegacyDmTarget(ccMatch[1]);
         if (!target) return null;
-        const count = Number.parseInt(ccMatch[2], 16);
-        if (Number.isNaN(count)) return null;
+        const count = parseClickCount(ccMatch[2]);
+        if (count === null) return null;
         const clicks = clampClickCount(count);
         return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }
@@ -457,8 +467,8 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     if (ccMatch) {
         const target = resolveButtonTarget(ccMatch[1]);
         if (!target) return null;
-        const count = Number.parseInt(ccMatch[2], 16);
-        if (Number.isNaN(count)) return null;
+        const count = parseClickCount(ccMatch[2]);
+        if (count === null) return null;
         const clicks = clampClickCount(count);
         return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }

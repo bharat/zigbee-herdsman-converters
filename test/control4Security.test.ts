@@ -300,4 +300,54 @@ describe("Control4 security hardening", () => {
             expect(result?.c4_device_type).toBe("keypaddim");
         });
     });
+
+    describe("wire ids", () => {
+        beforeEach(() => {
+            c4.resetC4ButtonLogState();
+        });
+
+        it("maps only the known ids to actions", () => {
+            const mapped: Record<string, string> = {
+                "00": "button_1_press",
+                "01": "button_2_press",
+                "02": "button_3_press",
+                "03": "button_4_press",
+                "04": "button_5_press",
+                "05": "button_6_press",
+                "07": "paddle_up_press",
+                "08": "paddle_down_press",
+            };
+            for (let id = 0; id < 256; id++) {
+                const hex = id.toString(16).padStart(2, "0");
+                const action = c4.parseButtonEvent(`0t0001 sa c4.dmx.bp ${hex}`)?.action;
+                expect(action).toBe(mapped[hex]);
+                if (action) expect(c4.ACTION_VALUES).toContain(action);
+            }
+        });
+
+        it.each(["1a2b3c4d5e", "001", "7", "0x", "g1"])("publishes no action for the malformed id %s", async (id) => {
+            for (const kind of ["bp", "sc"]) {
+                expect(c4.parseButtonEvent(`0t0001 sa c4.dmx.${kind} ${id}`)).toBeNull();
+            }
+            expect(c4.parseButtonEvent(`0t0001 sa c4.dmx.cc ${id} 01`)).toBeNull();
+
+            const {device} = makeDevice("0x5E31", {c4_device_type: "keypaddim", c4_type_confidence: "confirmed"});
+            const result = await raw(`0t0001 sa c4.dmx.bp ${id}`, device);
+            expect(result?.action).toBeUndefined();
+        });
+
+        it("ignores a click count that is not one or two hex digits", () => {
+            expect(c4.parseButtonEvent("0t0001 sa c4.dmx.cc 00 1ff")).toBeNull();
+            expect(c4.parseButtonEvent("0t0001 sa c4.dmx.cc 00 0x2")).toBeNull();
+            expect(c4.parseButtonEvent("0tdc28 sa c4.dm.cc 00 100")).toBeNull();
+        });
+
+        it("keeps the unknown-id log guard bounded", () => {
+            for (let id = 0; id < 256; id++) c4.parseButtonEvent(`0t0001 sa c4.dmx.bp ${id.toString(16).padStart(2, "0")}`);
+            for (let i = 0; i < 1000; i++) c4.parseButtonEvent(`0t0001 sa c4.dmx.bp ${i.toString(16).padStart(6, "0")}`);
+            const warnings = vi.mocked(logger.warning).mock.calls.filter((args) => String(args[0]).includes("Unknown wire id"));
+            // 248 unknown two-digit ids plus one shared malformed key, each logged once.
+            expect(warnings).toHaveLength(249);
+        });
+    });
 });

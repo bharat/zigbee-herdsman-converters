@@ -529,21 +529,21 @@ describe("Control4 protocol", () => {
             expect(event?.paddle).toBeUndefined();
         });
 
-        it("logs an unknown wire id once and does not crash", () => {
+        it("ignores an unknown wire id, logging it once", () => {
             // 0x06 is a gap between the button space (00-05) and the paddle space.
             const first = parseButtonEvent("0t0001 sa c4.dmx.bp 06");
             const second = parseButtonEvent("0t0002 sa c4.dmx.bp 06");
-            // Historical button_(N+1) mapping is preserved for compatibility.
-            expect(first).toEqual({action: "button_7_press", buttonId: 7, type: "press"});
-            expect(second).toEqual({action: "button_7_press", buttonId: 7, type: "press"});
+            // No action outside the frozen enum is published.
+            expect(first).toBeNull();
+            expect(second).toBeNull();
             // Logged exactly once.
             const unknownLogs = vi.mocked(logger.warning).mock.calls.filter((args) => String(args[0]).includes("Unknown wire id"));
             expect(unknownLogs).toHaveLength(1);
         });
 
-        it("logs a high unknown wire id (0x09) as unknown", () => {
+        it("ignores a high unknown wire id (0x09), logging it as unknown", () => {
             const event = parseButtonEvent("0t0001 sa c4.dmx.bp 09");
-            expect(event).toEqual({action: "button_10_press", buttonId: 10, type: "press"});
+            expect(event).toBeNull();
             expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining("Unknown wire id"), expect.anything());
         });
     });
