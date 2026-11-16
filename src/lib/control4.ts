@@ -74,34 +74,105 @@ export function parseC4Identity(data: KeyValue): C4Identity {
 }
 
 /**
+ * Minimum time between two persisted identity changes (firmware, or an
+ * unlisted model) or two dim-answer type heals for one device. Each persist
+ * rewrites the whole herdsman database, so a device flipping its reports
+ * must not be able to force a write per frame.
+ */
+export const C4_PERSIST_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+const c4LastIdentityPersist = new Map<string, number>();
+const c4LastDimHealPersist = new Map<string, number>();
+
+/** True when `ieeeAddr` hasn't persisted through `map` within C4_PERSIST_MIN_INTERVAL_MS. */
+function c4PersistDue(map: Map<string, number>, ieeeAddr: string): boolean {
+    const last = map.get(ieeeAddr);
+    return last === undefined || Date.now() - last >= C4_PERSIST_MIN_INTERVAL_MS;
+}
+
+/** Most entries any once-per-key log guard keeps, so hostile input can't grow it without bound. */
+const C4_LOG_GUARD_MAX = 256;
+
+/** Record `key` in a bounded once-only log guard; true the first time it is seen. */
+function c4FirstTime(guard: Set<string | number>, key: string | number): boolean {
+    if (guard.has(key)) return false;
+    if (guard.size >= C4_LOG_GUARD_MAX) guard.clear();
+    guard.add(key);
+    return true;
+}
+
+const loggedModelConflicts = new Set<string | number>();
+
+/** The listed model already stored for a device, which later reports can't replace. */
+function lockedC4Model(device: Zh.Device): string | undefined {
+    const model = device.meta.c4_model;
+    return typeof model === "string" && Object.hasOwn(C4_IDENTITY_MODELS, model) ? model : undefined;
+}
+
+/**
  * Store a parsed identity on the device (meta, plus modelID and
  * softwareBuildID, which Zigbee2MQTT shows as the model and firmware) and
  * return the c4_model /
  * c4_firmware state that changed, or undefined when nothing did (the
  * identity report repeats about once a minute).
+ *
+ * Once a listed model is stored it is kept: a different model reported
+ * later is ignored (logged once per device). Other identity changes are
+ * persisted at most once per C4_PERSIST_MIN_INTERVAL_MS per device; the
+ * first value, and a first listed model, are always taken.
  */
 export function applyC4Identity(device: Zh.Device | undefined, identity: C4Identity, state: KeyValue | undefined): KeyValue | undefined {
-    const changed: KeyValue = {};
-    if (identity.model && state?.c4_model !== identity.model) changed.c4_model = identity.model;
-    if (identity.firmware && state?.c4_firmware !== identity.firmware) changed.c4_firmware = identity.firmware;
+    let model = identity.model;
+    let firmware = identity.firmware;
 
     if (device) {
+        const ieeeAddr = device.ieeeAddr;
+        const locked = lockedC4Model(device);
+        if (model && locked && model !== locked) {
+            if (c4FirstTime(loggedModelConflicts, ieeeAddr)) {
+                logger.warning(`${ieeeAddr}: ignoring reported model ${JSON.stringify(model)}, already identified as ${locked}`, NS);
+            }
+            model = undefined;
+        }
+
+        const modelChanges = model !== undefined && device.meta.c4_model !== model;
+        const firmwareChanges = firmware !== undefined && (device.meta.c4_firmware !== firmware || device.softwareBuildID !== firmware);
+        // The first model, and the first listed one, are taken at once; so is the first firmware.
+        const modelFree = model !== undefined && (device.meta.c4_model === undefined || (!locked && Object.hasOwn(C4_IDENTITY_MODELS, model)));
+        const firmwareFree = device.meta.c4_firmware === undefined;
+        const due = c4PersistDue(c4LastIdentityPersist, ieeeAddr);
+        if (modelChanges && !modelFree && !due) {
+            logger.debug(`${ieeeAddr}: model change to ${JSON.stringify(model)} deferred (rate limited)`, NS);
+            model = undefined;
+        }
+        if (firmwareChanges && !firmwareFree && !due) {
+            logger.debug(`${ieeeAddr}: firmware change to ${JSON.stringify(firmware)} deferred (rate limited)`, NS);
+            firmware = undefined;
+        }
+
         let dirty = false;
-        if (identity.model && device.meta.c4_model !== identity.model) {
-            device.meta.c4_model = identity.model;
+        if (model && device.meta.c4_model !== model) {
+            device.meta.c4_model = model;
             dirty = true;
         }
-        if (identity.model && Object.hasOwn(C4_IDENTITY_MODELS, identity.model) && device.modelID !== identity.model) {
-            device.modelID = identity.model;
+        if (model && Object.hasOwn(C4_IDENTITY_MODELS, model) && device.modelID !== model) {
+            device.modelID = model;
             dirty = true;
         }
-        if (identity.firmware && (device.meta.c4_firmware !== identity.firmware || device.softwareBuildID !== identity.firmware)) {
-            device.meta.c4_firmware = identity.firmware;
-            device.softwareBuildID = identity.firmware;
+        if (firmware && (device.meta.c4_firmware !== firmware || device.softwareBuildID !== firmware)) {
+            device.meta.c4_firmware = firmware;
+            device.softwareBuildID = firmware;
             dirty = true;
         }
-        if (dirty) saveC4Device(device);
+        if (dirty) {
+            saveC4Device(device);
+            c4LastIdentityPersist.set(ieeeAddr, Date.now());
+        }
     }
+
+    const changed: KeyValue = {};
+    if (model && state?.c4_model !== model) changed.c4_model = model;
+    if (firmware && state?.c4_firmware !== firmware) changed.c4_firmware = firmware;
     return Object.keys(changed).length > 0 ? changed : undefined;
 }
 
@@ -1013,12 +1084,22 @@ interface C4MetaFields {
     silentProbes?: number;
 }
 
+/** Write the given fields to device.meta, saving only when one of them actually changed. */
 function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
-    if (fields.type !== undefined) device.meta.c4_device_type = fields.type;
-    if (fields.confidence !== undefined) device.meta.c4_type_confidence = fields.confidence;
-    if (fields.dimCode !== undefined) device.meta.c4_dim_code = fields.dimCode;
-    if (fields.silentProbes !== undefined) device.meta.c4_silent_probes = fields.silentProbes;
-    saveC4Device(device);
+    const updates: [string, unknown][] = [
+        ["c4_device_type", fields.type],
+        ["c4_type_confidence", fields.confidence],
+        ["c4_dim_code", fields.dimCode],
+        ["c4_silent_probes", fields.silentProbes],
+    ];
+    let dirty = false;
+    for (const [key, value] of updates) {
+        if (value !== undefined && device.meta[key] !== value) {
+            device.meta[key] = value;
+            dirty = true;
+        }
+    }
+    if (dirty) saveC4Device(device);
 }
 
 function stopC4ProbeCampaign(device: Zh.Device): void {
@@ -1046,14 +1127,20 @@ export function clearC4DeviceState(ieeeAddr: string): void {
     c4LoadStateTimers.delete(ieeeAddr);
 
     c4LastLsSeen.delete(ieeeAddr);
+    c4LastIdentityPersist.delete(ieeeAddr);
+    c4LastDimHealPersist.delete(ieeeAddr);
+    loggedModelConflicts.delete(ieeeAddr);
 }
 
-/** Reset all in-memory self-heal campaign state (for testing). */
+/** Reset all in-memory self-heal campaign and persist rate-limit state (for testing). */
 export function resetC4HealState(): void {
     for (const campaign of c4ProbeCampaigns.values()) {
         if (campaign.timer) clearTimeout(campaign.timer);
     }
     c4ProbeCampaigns.clear();
+    c4LastIdentityPersist.clear();
+    c4LastDimHealPersist.clear();
+    loggedModelConflicts.clear();
 }
 
 /**
@@ -1078,6 +1165,15 @@ export function applyC4Heal(
 
     const already = device.meta.c4_device_type === newType && device.meta.c4_type_confidence === C4_CONFIDENCE_CONFIRMED;
     if (already) return null;
+
+    // Dim answers can flip a load type back and forth (01 dimmer, 02
+    // keypaddim), each flip a database write: take one per interval.
+    const dimHeal = evidence.dimCode != null;
+    if (dimHeal && !c4PersistDue(c4LastDimHealPersist, device.ieeeAddr)) {
+        logger.debug(`${device.ieeeAddr}: type change to ${newType} deferred (rate limited)`, NS);
+        return null;
+    }
+    if (dimHeal) c4LastDimHealPersist.set(device.ieeeAddr, Date.now());
 
     const dimCode = evidence.dimCode != null ? evidence.dimCode : ((device.meta.c4_dim_code as string | null) ?? null);
     let evidenceDesc: string;

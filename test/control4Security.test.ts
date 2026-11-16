@@ -48,6 +48,17 @@ const asDevice = (d: MockDevice): Zh.Device => d as unknown as Zh.Device;
 
 const definition = definitions[0];
 const outlet = definitions[1];
+const [rawFz, identityFz] = definition.fromZigbee as unknown as [{convert: AnyFn}, {convert: AnyFn}];
+
+function raw(text: string, device: MockDevice, state: KeyValue = {}, publish: AnyFn = vi.fn()): Promise<KeyValue | undefined> {
+    const msg = {data: Buffer.from(text, "latin1"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+    return rawFz.convert(definition, msg, publish, {}, {state, device});
+}
+
+function identityReport(device: MockDevice, data: KeyValue, state: KeyValue = {}, extra: KeyValue = {}): KeyValue | undefined {
+    const msg = {data, endpoint: {ID: 2}, device, type: "attributeReport", cluster: "genPowerCfg", ...extra};
+    return identityFz.convert(definition, msg, vi.fn(), {}, {state, device});
+}
 
 describe("Control4 security hardening", () => {
     beforeEach(() => {
@@ -200,6 +211,93 @@ describe("Control4 security hardening", () => {
             });
             expect(() => c4.applyC4Identity(asDevice(device), {model: "C4-KD120", firmware: "5.1.1"}, {})).not.toThrow();
             expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining("does not exist"), "zhc:control4");
+        });
+    });
+
+    describe("persist rate limiting", () => {
+        const kd = "c4:control4_light:C4-KD120";
+        const apd = "c4:control4_light:C4-APD120";
+
+        it("keeps the first listed model and ignores a different one, logging once", () => {
+            const {device} = makeDevice("0x5E21");
+            // The first report also types the device from its model (a second save).
+            expect(identityReport(device, {4: "5.1.1", 7: kd})).toMatchObject({c4_model: "C4-KD120", c4_firmware: "5.1.1"});
+            const saves = device.save.mock.calls.length;
+
+            for (let i = 0; i < 10; i++) {
+                expect(identityReport(device, {7: i % 2 ? kd : apd}, {c4_model: "C4-KD120"})).toBeUndefined();
+            }
+
+            expect(device.meta.c4_model).toBe("C4-KD120");
+            expect(device.modelID).toBe("C4-KD120");
+            expect(device.save).toHaveBeenCalledTimes(saves);
+            const conflicts = vi.mocked(logger.warning).mock.calls.filter((args) => String(args[0]).includes("ignoring reported model"));
+            expect(conflicts).toHaveLength(1);
+        });
+
+        it("still takes a first listed model over an unlisted one", () => {
+            const {device} = makeDevice("0x5E22", {c4_model: "C4-XYZ"});
+            identityReport(device, {7: kd});
+            expect(device.meta.c4_model).toBe("C4-KD120");
+            expect(device.modelID).toBe("C4-KD120");
+        });
+
+        it("persists a firmware change at most once per interval", async () => {
+            const {device} = makeDevice("0x5E23");
+            expect(identityReport(device, {4: "1.0"})).toEqual({c4_firmware: "1.0"});
+            for (let i = 0; i < 20; i++) {
+                expect(identityReport(device, {4: i % 2 ? "1.0" : "1.1"}, {c4_firmware: "1.0"})).toBeUndefined();
+            }
+            expect(device.save).toHaveBeenCalledTimes(1);
+            expect(device.softwareBuildID).toBe("1.0");
+
+            await vi.advanceTimersByTimeAsync(c4.C4_PERSIST_MIN_INTERVAL_MS);
+            expect(identityReport(device, {4: "1.1"}, {c4_firmware: "1.0"})).toEqual({c4_firmware: "1.1"});
+            expect(device.save).toHaveBeenCalledTimes(2);
+            expect(device.softwareBuildID).toBe("1.1");
+        });
+
+        it("rate limits flipping unlisted models", () => {
+            const {device} = makeDevice("0x5E24");
+            identityReport(device, {7: "c4:x:AAA"});
+            identityReport(device, {7: "c4:x:BBB"});
+            identityReport(device, {7: "c4:x:AAA"});
+            expect(device.meta.c4_model).toBe("AAA");
+            expect(device.save).toHaveBeenCalledTimes(1);
+        });
+
+        it("never saves an unchanged identity", () => {
+            const {device} = makeDevice("0x5E25");
+            identityReport(device, {4: "5.1.1", 7: kd}, {});
+            const saves = device.save.mock.calls.length;
+            for (let i = 0; i < 5; i++) identityReport(device, {4: "5.1.1", 7: kd}, {});
+            expect(device.save).toHaveBeenCalledTimes(saves);
+        });
+
+        it("takes one dim-answer type change per interval", async () => {
+            const {device} = makeDevice("0x5E26", {c4_device_type: "keypad"});
+
+            const first = await raw("0r0001 000 c4.dmx.dim 01", device, {c4_device_type: "keypad"});
+            expect(first?.c4_device_type).toBe("dimmer");
+            const saves = device.save.mock.calls.length;
+
+            for (let i = 0; i < 10; i++) {
+                const code = i % 2 ? "01" : "02";
+                const result = await raw(`0r0001 000 c4.dmx.dim ${code}`, device, {c4_device_type: "dimmer"});
+                expect(result?.c4_device_type).toBeUndefined();
+            }
+            expect(device.meta.c4_device_type).toBe("dimmer");
+            expect(device.save.mock.calls.length).toBe(saves);
+
+            await vi.advanceTimersByTimeAsync(c4.C4_PERSIST_MIN_INTERVAL_MS);
+            const later = await raw("0r0001 000 c4.dmx.dim 02", device, {c4_device_type: "dimmer"});
+            expect(later?.c4_device_type).toBe("keypaddim");
+        });
+
+        it("ls telemetry still upgrades a keypad right after a dim heal elsewhere", async () => {
+            const {device} = makeDevice("0x5E27", {c4_device_type: "keypad"});
+            const result = await raw("0t0001 sa c4.dmx.ls 00 00 32", device, {c4_device_type: "keypad"});
+            expect(result?.c4_device_type).toBe("keypaddim");
         });
     });
 });
