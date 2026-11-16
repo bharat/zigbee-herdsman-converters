@@ -851,7 +851,7 @@ describe("Control4 glue", () => {
                         const answer = respond(cmdBody);
                         // null answer = silence: let the query time out
                         if (answer !== null) {
-                            queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                            queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`, ieeeAddr));
                         }
                     }
                     return Promise.resolve();
@@ -1248,7 +1248,7 @@ describe("Control4 glue", () => {
                 if (match) {
                     const [, seq, cmdBody] = match;
                     const answer = cmdBody === "c4.dmx.dim" ? (dimCode === null ? null : `000 c4.dmx.dim ${dimCode}`) : "000 c4.dmx.led ffffff";
-                    if (answer !== null) queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                    if (answer !== null) queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`, ieeeAddr));
                 }
                 return Promise.resolve();
             });

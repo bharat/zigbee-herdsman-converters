@@ -790,39 +790,83 @@ export async function queryC4(device: Zh.Device, cmdBody: string): Promise<strin
 }
 
 // Queries go out on EP 1 but responses arrive from EP 197, so awaitable
-// queries register a resolver keyed by seq; the raw fromZigbee handler
-// resolves it when the matching response arrives.
-const pendingQueries = new Map<string, (responseText: string) => void>();
+// queries register a waiter; the raw fromZigbee handler resolves it when
+// the matching response arrives. The sequence number is global and sent in
+// the clear, so a waiter is bound to the queried device's IEEE address and
+// command: a reply from any other device, or one answering a different
+// command, can't resolve it (bharat/homeassistant-control4-zigbee#241).
+interface C4PendingQuery {
+    ieeeAddr: string;
+    command: string;
+    settle: (responseText: string | null) => void;
+}
 
-/** Resolve a pending query by response sequence. Returns true when a waiter existed. */
-export function resolveC4PendingQuery(seq: string, responseText: string): boolean {
-    const handler = pendingQueries.get(seq);
-    if (!handler) return false;
-    handler(responseText);
+const pendingQueries = new Map<string, C4PendingQuery>();
+
+function pendingQueryKey(ieeeAddr: string, seq: string): string {
+    return `${ieeeAddr}/${seq.toLowerCase()}`;
+}
+
+/**
+ * True when a reply could answer a query for `command`. A success reply
+ * ("0r<seq> 000 <command> <data>") must echo the queried command; an error
+ * reply ("0r<seq> n01", "0r<seq> v01") carries no echo and is accepted.
+ */
+export function isPlausibleC4Reply(responseText: string, command: string): boolean {
+    const match = /^0r[0-9a-fA-F]{4}\s+(\S+)(?:\s+(\S+))?/.exec(responseText);
+    if (!match) return false;
+    if (match[1] !== "000") return true;
+    return match[2] === undefined || match[2] === command;
+}
+
+/**
+ * Resolve the query `ieeeAddr` has pending under response sequence `seq`.
+ * Returns true when that device had such a waiter and the reply plausibly
+ * answers its command.
+ */
+export function resolveC4PendingQuery(seq: string, responseText: string, ieeeAddr: string | undefined): boolean {
+    if (!ieeeAddr) return false;
+    const pending = pendingQueries.get(pendingQueryKey(ieeeAddr, seq));
+    if (!pending || pending.ieeeAddr !== ieeeAddr) return false;
+    if (!isPlausibleC4Reply(responseText, pending.command)) {
+        logger.debug(`${ieeeAddr}: reply for seq ${seq} doesn't answer ${pending.command}, ignored`, NS);
+        return false;
+    }
+    pending.settle(responseText);
     return true;
+}
+
+/** Give up every query pending for a device (it left or was removed). */
+function abandonC4PendingQueries(ieeeAddr: string): void {
+    for (const pending of [...pendingQueries.values()]) {
+        if (pending.ieeeAddr === ieeeAddr) pending.settle(null);
+    }
 }
 
 export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, timeoutMs = 3000): Promise<string | null> {
     const seq = nextSeq();
+    const key = pendingQueryKey(device.ieeeAddr, seq);
 
     return await new Promise((resolve) => {
+        let settled = false;
+        const settle = (responseText: string | null): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (pendingQueries.get(key)?.settle === settle) pendingQueries.delete(key);
+            resolve(responseText);
+        };
+
         const timer = setTimeout(() => {
-            pendingQueries.delete(seq);
             logger.warning(`Timeout for seq ${seq}: ${cmdBody}`, NS);
-            resolve(null);
+            settle(null);
         }, timeoutMs);
 
-        pendingQueries.set(seq, (responseText) => {
-            clearTimeout(timer);
-            pendingQueries.delete(seq);
-            resolve(responseText);
-        });
+        pendingQueries.set(key, {ieeeAddr: device.ieeeAddr, command: cmdBody.trim().split(/\s+/)[0], settle});
 
         sendC4Raw(device, formatGetCommand(seq, cmdBody)).catch((err) => {
-            clearTimeout(timer);
-            pendingQueries.delete(seq);
             logger.warning(`Send failed for seq ${seq}: ${(err as Error).message}`, NS);
-            resolve(null);
+            settle(null);
         });
     });
 }
@@ -1158,6 +1202,7 @@ export function clearC4DeviceState(ieeeAddr: string): void {
     c4LastLsSeen.delete(ieeeAddr);
     c4LastIdentityPersist.delete(ieeeAddr);
     c4LastDimHealPersist.delete(ieeeAddr);
+    abandonC4PendingQueries(ieeeAddr);
     loggedModelConflicts.delete(ieeeAddr);
 }
 

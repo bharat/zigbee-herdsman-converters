@@ -393,4 +393,58 @@ describe("Control4 security hardening", () => {
             expect(identityReport(device, {7: "c4:x:C4-KD120"}, {}, {profileId: c4.C4_IDENTITY_PROFILE})).toMatchObject({c4_model: "C4-KD120"});
         });
     });
+
+    describe("query reply matching (bharat/homeassistant-control4-zigbee#241)", () => {
+        /** Start a query on `device` and return its promise plus the sequence number it went out with. */
+        async function startQuery(device: MockDevice, sent: string[], cmdBody: string) {
+            const promise = c4.queryC4WithResponse(asDevice(device), cmdBody, 3000);
+            await Promise.resolve();
+            const seq = /^0g([0-9a-f]{4}) /.exec(sent[sent.length - 1])?.[1];
+            if (!seq) throw new Error("query not sent");
+            return {promise, seq};
+        }
+
+        it("only the queried device's reply resolves the query", async () => {
+            const {device: victim, sent} = makeDevice("0x5E51", {c4_device_type: "keypad", c4_type_confidence: "confirmed"});
+            const {device: other} = makeDevice("0x5E52", {c4_device_type: "keypad", c4_type_confidence: "confirmed"});
+            const {promise, seq} = await startQuery(victim, sent, "c4.dmx.dim");
+
+            await raw(`0r${seq} 000 c4.dmx.dim 01`, other);
+            expect(c4.resolveC4PendingQuery(seq, `0r${seq} 000 c4.dmx.dim 01`, undefined)).toBe(false);
+            await raw(`0r${seq} 000 c4.dmx.dim 02`, victim);
+
+            expect(await promise).toBe(`0r${seq} 000 c4.dmx.dim 02`);
+        });
+
+        it("a reply that answers a different command doesn't resolve the query", async () => {
+            const {device, sent} = makeDevice("0x5E53");
+            const {promise, seq} = await startQuery(device, sent, "c4.dmx.led 01 03");
+
+            expect(c4.resolveC4PendingQuery(seq, `0r${seq} 000 c4.dmx.dim 01`, device.ieeeAddr)).toBe(false);
+            expect(c4.resolveC4PendingQuery(seq, `0r${seq} 000 c4.dmx.led 00ff00`, device.ieeeAddr)).toBe(true);
+            expect(await promise).toBe(`0r${seq} 000 c4.dmx.led 00ff00`);
+        });
+
+        it("an error reply still resolves (it carries no echo)", async () => {
+            const {device, sent} = makeDevice("0x5E54");
+            const {promise, seq} = await startQuery(device, sent, "c4.dmx.dim");
+            expect(c4.resolveC4PendingQuery(seq, `0r${seq} n01`, device.ieeeAddr)).toBe(true);
+            expect(await promise).toBe(`0r${seq} n01`);
+        });
+
+        it("isPlausibleC4Reply checks the frame shape and the echoed command", () => {
+            expect(c4.isPlausibleC4Reply("0r0001 000 c4.dm.tv 0064", "c4.dm.tv")).toBe(true);
+            expect(c4.isPlausibleC4Reply("0r0001 v01", "c4.dm.tv")).toBe(true);
+            expect(c4.isPlausibleC4Reply("0r0001 000 c4.dmx.led 0064", "c4.dm.tv")).toBe(false);
+            expect(c4.isPlausibleC4Reply("0t0001 sa c4.dm.tv 0064", "c4.dm.tv")).toBe(false);
+        });
+
+        it("the stop event gives up the device's pending queries at once", async () => {
+            const {device, sent} = makeDevice("0x5E55");
+            const {promise} = await startQuery(device, sent, "c4.dmx.dim");
+            await (definition.onEvent as AnyFn)({type: "stop", data: {ieeeAddr: device.ieeeAddr}});
+            expect(await promise).toBeNull();
+            expect(logger.warning).not.toHaveBeenCalledWith(expect.stringContaining("Timeout"), "zhc:control4");
+        });
+    });
 });

@@ -42,7 +42,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
             logger.debug(`Received EP ${epId}: ${text}`, NS);
 
             const respSeq = c4.parseResponseSeq(text);
-            if (respSeq && c4.resolveC4PendingQuery(respSeq, text)) {
+            if (respSeq && c4.resolveC4PendingQuery(respSeq, text, msg.device?.ieeeAddr)) {
                 logger.debug(`Resolved pending query seq ${respSeq}`, NS);
             }
 
