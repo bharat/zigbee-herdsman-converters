@@ -347,7 +347,7 @@ export function formatGetCommand(seq: string, cmdBody: string): string {
 /** Parse LED color from response: "0r<seq> 000 c4.dmx.led <RRGGBB>" → hex string or null */
 export function parseLedColorResponse(responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dmx\.led (\w{6})/);
+    const match = responseText.match(/000 c4\.dmx\.led ([0-9a-fA-F]{6})/);
     return match ? match[1].toLowerCase() : null;
 }
 
@@ -534,6 +534,9 @@ function warnC4Frame(ieeeAddr: string | undefined, message: string): void {
     logger.warning(message, NS);
 }
 
+/** One ls data field: one to four hex digits. */
+const C4_TELEMETRY_FIELD = /^[0-9a-fA-F]{1,4}$/;
+
 /** Parse load telemetry as a hex percent (0x00-0x64): dmx "c4.dmx.ls" (third data field) or legacy "c4.dm.t0c <level>". */
 export function parseLoadStatus(text: string, ieeeAddr?: string): {level: number} | null {
     // dmx telemetry: the third data field is the level. Legacy "c4.dm." dimmers
@@ -541,7 +544,7 @@ export function parseLoadStatus(text: string, ieeeAddr?: string): {level: number
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls \w+ \w+ (\w+)/) ?? text.match(/^0t\w+ sa c4\.dm\.t0c (\w+)/);
     if (!match) return null;
 
-    const level = Number.parseInt(match[1], 16);
+    const level = C4_TELEMETRY_FIELD.test(match[1]) ? Number.parseInt(match[1], 16) : Number.NaN;
     if (Number.isNaN(level) || level > 0x64) {
         warnC4Frame(ieeeAddr, `${ieeeAddr ?? "?"}: ignoring out-of-range load level: ${c4LogText(text)}`);
         return null;
@@ -553,21 +556,48 @@ export function parseLoadStatus(text: string, ieeeAddr?: string): {level: number
 /** Number of data fields in a full ls frame; shorter frames carry no electrical readings. */
 const C4_LS_TELEMETRY_FIELDS = 10;
 
+/** Most data fields an ls frame may carry before it is treated as malformed. */
+const C4_LS_TELEMETRY_MAX_FIELDS = 16;
+
+/**
+ * Inclusive plausibility range of each electrical reading, generous for a
+ * 120-277 V in-wall load. A reading outside its range drops the whole set
+ * rather than letting a garbage value reach long-term statistics.
+ */
+export const C4_TELEMETRY_RANGES = {
+    voltage: [0, 600],
+    currentMa: [0, 20000],
+    power: [0, 5000],
+    apparentPower: [0, 5000],
+    powerFactor: [0, 1000],
+} as const;
+
 /**
  * Parse the electrical readings from a full ls frame, for example
  * "0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000".
  * After the level: volts, milliamps, watts, volt-amps, power factor x1000, and
  * two fields of unknown meaning, published raw. The names are inferred from
  * captured frames (V x mA = VA, VA x PF = W), not from documentation.
+ * Every field must be 1-4 hex digits and every named reading within
+ * C4_TELEMETRY_RANGES, else the readings are dropped (null).
  */
 export function parseLoadTelemetry(text: string): KeyValue | null {
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls\s+(.+)$/);
     if (!match) return null;
 
     const fields = match[1].trim().split(/\s+/);
-    if (fields.length < C4_LS_TELEMETRY_FIELDS || !fields.every((field) => /^[0-9a-fA-F]+$/.test(field))) return null;
+    if (fields.length < C4_LS_TELEMETRY_FIELDS || fields.length > C4_LS_TELEMETRY_MAX_FIELDS) return null;
+    if (!fields.every((field) => C4_TELEMETRY_FIELD.test(field))) return null;
 
     const [voltage, currentMa, power, apparentPower, powerFactor, unknown9, unknown10] = fields.slice(3).map((field) => Number.parseInt(field, 16));
+    const readings = {voltage, currentMa, power, apparentPower, powerFactor};
+    for (const [name, [min, max]] of Object.entries(C4_TELEMETRY_RANGES)) {
+        const value = readings[name as keyof typeof readings];
+        if (value < min || value > max) {
+            logger.debug(`Dropping implausible load telemetry (${name} ${value}): ${c4LogText(text)}`, NS);
+            return null;
+        }
+    }
     return {
         c4_load_voltage: voltage,
         c4_load_current: currentMa,

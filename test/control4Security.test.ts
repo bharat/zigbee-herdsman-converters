@@ -598,4 +598,53 @@ describe("Control4 security hardening", () => {
             expect(sent[0]).toMatch(/^0s[0-9a-f]{4} c4\.dmx\.led 01 03 ff0000\r\n$/);
         });
     });
+
+    describe("telemetry and colors", () => {
+        const good = "0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000";
+
+        it("keeps a real frame's readings", () => {
+            expect(c4.parseLoadTelemetry(good)).toEqual({
+                c4_load_voltage: 121,
+                c4_load_current: 112,
+                c4_load_power: 13,
+                c4_load_apparent_power: 14,
+                c4_load_power_factor: 0.938,
+                c4_load_field_9: 0,
+                c4_load_field_10: 0,
+            });
+        });
+
+        it.each([
+            ["an overlong field", "0t1 sa c4.dmx.ls 00 00 10 ffffffffffffffffffffffffffffffff 0 0 0 0 0 0"],
+            ["a five-digit field", "0t1 sa c4.dmx.ls 00 00 10 00079 0070 000d 000e 03aa 0000 0000"],
+            ["an implausible voltage", "0t1 sa c4.dmx.ls 00 00 10 ffff 0070 000d 000e 03aa 0000 0000"],
+            ["an implausible current", "0t1 sa c4.dmx.ls 00 00 10 0079 ffff 000d 000e 03aa 0000 0000"],
+            ["an implausible power", "0t1 sa c4.dmx.ls 00 00 10 0079 0070 ffff 000e 03aa 0000 0000"],
+            ["an implausible apparent power", "0t1 sa c4.dmx.ls 00 00 10 0079 0070 000d ffff 03aa 0000 0000"],
+            ["a power factor above 1", "0t1 sa c4.dmx.ls 00 00 10 0079 0070 000d 000e 03e9 0000 0000"],
+            ["too many fields", `0t1 sa c4.dmx.ls 00 00 10 0079 0070 000d 000e 03aa${" 0".repeat(10)}`],
+        ])("drops the readings for %s", (_label, frame) => {
+            expect(c4.parseLoadTelemetry(frame)).toBeNull();
+        });
+
+        it("an implausible frame still publishes the level but no readings", async () => {
+            const {device} = makeDevice("0x5E81", {c4_device_type: "keypaddim", c4_type_confidence: "confirmed"});
+            const publish = vi.fn();
+            await raw("0t1 sa c4.dmx.ls 00 00 32 ffff 0070 000d 000e 03aa 0000 0000", device, {}, publish);
+            await vi.advanceTimersByTimeAsync(c4.C4_LOAD_STATE_DEBOUNCE_MS + 10);
+            expect(publish).toHaveBeenCalledExactlyOnceWith({state: "ON", brightness: 128});
+        });
+
+        it("rejects a level that is not 1-4 hex digits", () => {
+            expect(c4.parseLoadStatus("0t1 sa c4.dmx.ls 00 00 1zz")).toBeNull();
+            expect(c4.parseLoadStatus("0t1 sa c4.dm.t0c 0x32")).toBeNull();
+            expect(c4.parseLoadStatus("0t1 sa c4.dmx.ls 00 00 32")).toEqual({level: 50});
+        });
+
+        it("reads only hex LED colors", () => {
+            expect(c4.parseLedColorResponse("0r0001 000 c4.dmx.led zzzzzz")).toBeNull();
+            expect(c4.parseLedColorResponse("0r0001 000 c4.dmx.led ___123")).toBeNull();
+            expect(c4.parseLedColorResponse("0r0001 000 c4.dmx.led A0b1C2")).toBe("a0b1c2");
+        });
+    });
 });
