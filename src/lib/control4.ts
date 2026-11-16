@@ -1259,6 +1259,31 @@ function stopC4ProbeCampaign(device: Zh.Device): void {
     c4ProbeCampaigns.delete(device.ieeeAddr);
 }
 
+// Diagnostic and read-back commands each send a burst of queries; a
+// repeated publish while one is still running is refused rather than
+// stacking a second burst on the same device.
+//
+// Each running operation holds a unique token, so a run that outlives a
+// "stop" can't release the guard of a newer run.
+const c4InFlight = new Map<string, symbol>();
+
+/**
+ * Run `fn` unless `operation` is already running for this device, in which
+ * case throw. `operation` may carry an argument (such as a slot id) when
+ * different arguments are independent.
+ */
+export async function withC4InFlightGuard<T>(device: Zh.Device, operation: string, fn: () => Promise<T>): Promise<T> {
+    const key = `${device.ieeeAddr}/${operation}`;
+    if (c4InFlight.has(key)) throw new Error(`${operation} is already running for ${device.ieeeAddr}`);
+    const token = Symbol(key);
+    c4InFlight.set(key, token);
+    try {
+        return await fn();
+    } finally {
+        if (c4InFlight.get(key) === token) c4InFlight.delete(key);
+    }
+}
+
 /**
  * Drop every timer and in-memory record kept for a device. Called on the
  * definition's "stop" event, which Zigbee2MQTT sends when the device leaves
@@ -1282,6 +1307,9 @@ export function clearC4DeviceState(ieeeAddr: string): void {
     c4LastIdentityPersist.delete(ieeeAddr);
     c4LastDimHealPersist.delete(ieeeAddr);
     abandonC4PendingQueries(ieeeAddr);
+    for (const key of [...c4InFlight.keys()]) {
+        if (key.startsWith(`${ieeeAddr}/`)) c4InFlight.delete(key);
+    }
     loggedModelConflicts.delete(ieeeAddr);
 }
 

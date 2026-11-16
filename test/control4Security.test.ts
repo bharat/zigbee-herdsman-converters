@@ -647,4 +647,83 @@ describe("Control4 security hardening", () => {
             expect(c4.parseLedColorResponse("0r0001 000 c4.dmx.led A0b1C2")).toBe("a0b1c2");
         });
     });
+
+    describe("MQTT-triggered work", () => {
+        it("zcl_read caps and type-checks the attribute list", async () => {
+            const {device, ep1} = makeDevice("0x5E91");
+            const zclRead = tz("zcl_read");
+            const many = Array.from({length: 33}, (_, i) => i);
+
+            await expect(zclRead(undefined, "zcl_read", {cluster: "genBasic", attributes: many}, tzMeta(device))).rejects.toThrow(/at most 32/);
+            await expect(zclRead(undefined, "zcl_read", {cluster: "genBasic", attributes: [{}]}, tzMeta(device))).rejects.toThrow(/names or numeric/);
+            await expect(zclRead(undefined, "zcl_read", {cluster: "genBasic", attributes: "modelId"}, tzMeta(device))).rejects.toThrow(/array/);
+            expect(ep1.read).not.toHaveBeenCalled();
+
+            await zclRead(undefined, "zcl_read", {cluster: "genBasic", attributes: many.slice(0, 32)}, tzMeta(device));
+            expect(ep1.read).toHaveBeenCalledTimes(1);
+        });
+
+        it.each([
+            ["c4_read_dimming", true],
+            ["c4_detect", true],
+            ["c4_verify_slot", 3],
+        ])("%s refuses a repeat while one is running, then runs again", async (key, value) => {
+            const {device, sent} = makeDevice("0x5E92");
+            const convert = tz(key);
+
+            const first = convert(undefined, key, value, tzMeta(device));
+            await expect(convert(undefined, key, value, tzMeta(device))).rejects.toThrow(/already running/);
+            const burst = sent.length;
+
+            await vi.advanceTimersByTimeAsync(60000);
+            await first;
+            expect(sent.length).toBeGreaterThan(burst);
+
+            const second = convert(undefined, key, value, tzMeta(device));
+            await vi.advanceTimersByTimeAsync(60000);
+            await expect(second).resolves.not.toThrow();
+        });
+
+        it("guards per device, and per slot for c4_verify_slot", async () => {
+            const {device} = makeDevice("0x5E93");
+            const {device: other} = makeDevice("0x5E94");
+            const verify = tz("c4_verify_slot");
+
+            const runs = [
+                verify(undefined, "c4_verify_slot", 1, tzMeta(device)),
+                verify(undefined, "c4_verify_slot", 2, tzMeta(device)),
+                verify(undefined, "c4_verify_slot", 1, tzMeta(other)),
+            ];
+            await vi.advanceTimersByTimeAsync(60000);
+            await expect(Promise.all(runs)).resolves.toBeDefined();
+        });
+
+        it("a thrown run releases the guard", async () => {
+            const {device} = makeDevice("0x5E95");
+            device.getEndpoint.mockImplementation(() => undefined);
+            const readDimming = tz("c4_read_dimming");
+            // Every query fails to send (no endpoint) and the table comes back empty.
+            const run = readDimming(undefined, "c4_read_dimming", true, tzMeta(device));
+            await vi.advanceTimersByTimeAsync(60000);
+            await run;
+            await expect(c4.withC4InFlightGuard(asDevice(device), "x", () => Promise.reject(new Error("boom")))).rejects.toThrow("boom");
+            await expect(c4.withC4InFlightGuard(asDevice(device), "x", () => Promise.resolve(1))).resolves.toBe(1);
+        });
+
+        it("a run that outlives a stop event doesn't release a newer run's guard", async () => {
+            const {device} = makeDevice("0x5E96");
+            let finishOld: (value: number) => void = () => {};
+            const old = c4.withC4InFlightGuard(asDevice(device), "op", () => new Promise<number>((resolve) => (finishOld = resolve)));
+
+            await (definition.onEvent as AnyFn)({type: "stop", data: {ieeeAddr: device.ieeeAddr}});
+            let finishNew: (value: number) => void = () => {};
+            const fresh = c4.withC4InFlightGuard(asDevice(device), "op", () => new Promise<number>((resolve) => (finishNew = resolve)));
+
+            finishOld(1);
+            await old;
+            await expect(c4.withC4InFlightGuard(asDevice(device), "op", () => Promise.resolve(3))).rejects.toThrow(/already running/);
+            finishNew(2);
+            await expect(fresh).resolves.toBe(2);
+        });
+    });
 });

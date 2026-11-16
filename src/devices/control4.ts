@@ -256,6 +256,9 @@ const tzControl4Query = {
     },
 } satisfies Tz.Converter;
 
+/** Most attributes one zcl_read may ask for; a failed batch falls back to one read (10 s timeout) each. */
+const ZCL_READ_MAX_ATTRIBUTES = 32;
+
 // Read arbitrary ZCL attributes for device interrogation; results are
 // published as probe_result.
 const tzControl4ZclRead = {
@@ -274,8 +277,14 @@ const tzControl4ZclRead = {
             attributes = [...c4.GENBASIC_ATTRS];
         }
 
-        if (!attributes || attributes.length === 0) {
+        if (!Array.isArray(attributes) || attributes.length === 0) {
             throw new Error('zcl_read requires "attributes" array (or use cluster "genBasic" for defaults)');
+        }
+        if (attributes.length > ZCL_READ_MAX_ATTRIBUTES) {
+            throw new Error(`zcl_read reads at most ${ZCL_READ_MAX_ATTRIBUTES} attributes, got ${attributes.length}`);
+        }
+        if (!attributes.every((attr) => typeof attr === "string" || typeof attr === "number")) {
+            throw new Error("zcl_read attributes must be names or numeric ids");
         }
 
         logger.info(`Reading EP ${epId} cluster ${cluster}: ${JSON.stringify(attributes)}`, NS);
@@ -355,34 +364,36 @@ const tzControl4Detect = {
         const device = meta.device;
         if (!device) throw new Error("c4_detect requires a device");
 
-        const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
-        const colorState = await c4.readStoredColors(device, deviceType);
+        return await c4.withC4InFlightGuard(device, "c4_detect", async () => {
+            const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
+            const colorState = await c4.readStoredColors(device, deviceType);
 
-        const state: KeyValue = {
-            c4_device_type: deviceType,
-            ...colorState,
-        };
+            const state: KeyValue = {
+                c4_device_type: deviceType,
+                ...colorState,
+            };
 
-        // A detect that times out yields an assumed keypad, which the active
-        // probe campaign may later confirm or heal.
-        device.meta.c4_device_type = deviceType;
-        device.meta.c4_type_confidence = confidence;
-        device.meta.c4_dim_code = dimCode ?? null;
-        device.save();
+            // A detect that times out yields an assumed keypad, which the active
+            // probe campaign may later confirm or heal.
+            device.meta.c4_device_type = deviceType;
+            device.meta.c4_type_confidence = confidence;
+            device.meta.c4_dim_code = dimCode ?? null;
+            device.save();
 
-        state.c4_detect_result = {
-            ieee_address: device.ieeeAddr,
-            device_type: deviceType,
-            confidence,
-            dim_code: dimCode ?? null,
-            model: model ?? c4.MODEL_NAMES[deviceType] ?? "unknown",
-            description: c4.MODEL_DESCRIPTIONS[deviceType] ?? "Unknown Control4 device",
-            colors_read: Object.keys(colorState).length,
-            ...(model ? {evidence: `reported model ${model}`} : {}),
-        };
+            state.c4_detect_result = {
+                ieee_address: device.ieeeAddr,
+                device_type: deviceType,
+                confidence,
+                dim_code: dimCode ?? null,
+                model: model ?? c4.MODEL_NAMES[deviceType] ?? "unknown",
+                description: c4.MODEL_DESCRIPTIONS[deviceType] ?? "Unknown Control4 device",
+                colors_read: Object.keys(colorState).length,
+                ...(model ? {evidence: `reported model ${model}`} : {}),
+            };
 
-        logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
-        return {state};
+            logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
+            return {state};
+        });
     },
 } satisfies Tz.Converter;
 
@@ -403,13 +414,17 @@ const tzControl4VerifySlot = {
             throw new Error(`c4_verify_slot expects a slot id 1-${c4.BUTTONS.length}, got "${value}"`);
         }
 
-        const observed = await c4.readStoredSlotConfig(meta.device, slotId);
-        logger.debug(`${c4.c4DeviceLabel(meta.device)} verify slot ${slotId}: ${JSON.stringify(observed)}`, NS);
+        const device = meta.device;
+        // One read per slot at a time; different slots stay independent.
+        await c4.withC4InFlightGuard(device, `c4_verify_slot:${slotId}`, async () => {
+            const observed = await c4.readStoredSlotConfig(device, slotId);
+            logger.debug(`${c4.c4DeviceLabel(device)} verify slot ${slotId}: ${JSON.stringify(observed)}`, NS);
 
-        // Publish directly (rather than returning state) so the marker clear
-        // is guaranteed to follow the verify payload in order.
-        meta.publish({...observed, c4_verified_slot: slotId});
-        meta.publish({c4_verified_slot: null});
+            // Publish directly (rather than returning state) so the marker clear
+            // is guaranteed to follow the verify payload in order.
+            meta.publish({...observed, c4_verified_slot: slotId});
+            meta.publish({c4_verified_slot: null});
+        });
     },
 } satisfies Tz.Converter;
 
@@ -436,7 +451,8 @@ const tzControl4ReadDimming = {
     convertSet: async (entity, key, value, meta) => {
         if (!meta.device) throw new Error("c4_read_dimming requires a device");
         // Publish directly, as c4_verify_slot does: Z2M doesn't publish state returned from this command.
-        meta.publish(await c4.readDimmingTable(meta.device));
+        const device = meta.device;
+        meta.publish(await c4.withC4InFlightGuard(device, "c4_read_dimming", () => c4.readDimmingTable(device)));
     },
 } satisfies Tz.Converter;
 
