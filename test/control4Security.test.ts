@@ -350,4 +350,47 @@ describe("Control4 security hardening", () => {
             expect(warnings).toHaveLength(249);
         });
     });
+
+    describe("identity model", () => {
+        it("stores a listed model or a short plain name only", () => {
+            expect(c4.parseC4Identity({7: "c4:control4_light:C4-KD120"}).model).toBe("C4-KD120");
+            expect(c4.parseC4Identity({7: "c4:x:C4-NEW-THING9"}).model).toBe("C4-NEW-THING9");
+            for (const bad of ["c4:x:ZZZ\n[fake log line]", "c4:x:has space", "c4:x:semi;colon", `c4:x:${"A".repeat(33)}`, "c4:x:\u001b[2J", ""]) {
+                expect(c4.parseC4Identity({7: bad}).model).toBeUndefined();
+            }
+        });
+
+        it("drops a firmware string with control characters or excess length", () => {
+            expect(c4.parseC4Identity({4: "5.1.1"}).firmware).toBe("5.1.1");
+            expect(c4.parseC4Identity({4: "1.0\r\nINJECTED"}).firmware).toBeUndefined();
+            expect(c4.parseC4Identity({4: "9".repeat(33)}).firmware).toBeUndefined();
+        });
+
+        it("never stores a malformed model on the device", () => {
+            const {device} = makeDevice("0x5E41");
+            expect(identityReport(device, {7: "c4:x:ZZZ\nfoo"})).toBeUndefined();
+            expect(device.meta.c4_model).toBeUndefined();
+            expect(device.save).not.toHaveBeenCalled();
+        });
+
+        it("an unlisted meta model doesn't shadow a listed modelID", () => {
+            const {device} = makeDevice("0x5E42", {c4_model: "ZZZ"});
+            device.modelID = "C4-KD120";
+            expect(c4.c4ModelType(asDevice(device))).toEqual({model: "C4-KD120", type: "keypaddim"});
+            expect(c4.c4ModelType(asDevice(device), {c4_model: "C4-KC120277"})).toEqual({model: "C4-KC120277", type: "keypad"});
+        });
+
+        it("an inherited property name never counts as a model", () => {
+            const {device} = makeDevice("0x5E43", {c4_model: "constructor"});
+            device.modelID = "__proto__";
+            expect(c4.c4ModelType(asDevice(device), {c4_model: "toString"})).toBeUndefined();
+        });
+
+        it("ignores an identity frame on another profile when the message carries one", () => {
+            const {device} = makeDevice("0x5E44");
+            expect(identityReport(device, {7: "c4:x:C4-KD120"}, {}, {profileId: 0x0104})).toBeUndefined();
+            expect(device.meta.c4_model).toBeUndefined();
+            expect(identityReport(device, {7: "c4:x:C4-KD120"}, {}, {profileId: c4.C4_IDENTITY_PROFILE})).toMatchObject({c4_model: "C4-KD120"});
+        });
+    });
 });

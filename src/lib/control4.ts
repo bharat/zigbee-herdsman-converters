@@ -58,17 +58,35 @@ export interface C4Identity {
     firmware?: string;
 }
 
-/** Extract model and firmware from an identity report or read response (keyed by raw attribute ID). */
+/** Shape an unlisted reported model must have to be stored or published. */
+const C4_MODEL_NAME = /^[A-Za-z0-9-]{1,32}$/;
+
+/** Shape a reported firmware version must have: printable ASCII, at most 32 characters. */
+const C4_FIRMWARE_VERSION = /^[\x20-\x7e]{1,32}$/;
+
+/** True for a model name that may be stored: a listed model, or a short plain name. */
+export function isAcceptableC4Model(model: string): boolean {
+    return Object.hasOwn(C4_IDENTITY_MODELS, model) || C4_MODEL_NAME.test(model);
+}
+
+/**
+ * Extract model and firmware from an identity report or read response (keyed
+ * by raw attribute ID). A model that is neither listed nor a short plain name,
+ * or a firmware string with control characters, is dropped.
+ */
 export function parseC4Identity(data: KeyValue): C4Identity {
     const identity: C4Identity = {};
     const model = data[C4_ATTR_MODEL];
     if (typeof model === "string") {
         // "c4:control4_light:C4-APD120" -> "C4-APD120"
-        identity.model = /^c4:[^:]*:(.+)$/.exec(model)?.[1] ?? model;
+        const name = /^c4:[^:]*:(.+)$/.exec(model)?.[1] ?? model;
+        if (isAcceptableC4Model(name)) identity.model = name;
+        else logger.debug(`Ignoring malformed reported model ${JSON.stringify(model.slice(0, 64))}`, NS);
     }
     const firmware = data[C4_ATTR_FIRMWARE];
     if (typeof firmware === "string") {
-        identity.firmware = firmware;
+        if (C4_FIRMWARE_VERSION.test(firmware)) identity.firmware = firmware;
+        else logger.debug(`Ignoring malformed reported firmware ${JSON.stringify(firmware.slice(0, 64))}`, NS);
     }
     return identity;
 }
@@ -607,13 +625,14 @@ export interface C4ModelType {
 
 /**
  * The type fixed by the device's reported model, or undefined while the model
- * is unknown or names no fixed type. The model is the one applyC4Identity
- * stored in meta, else the published c4_model, else a modelID it rewrote.
+ * is unknown or names no fixed type. The model is the first listed one of:
+ * the one applyC4Identity stored in meta, the published c4_model, and a
+ * modelID it rewrote. An unlisted model never shadows a listed one further
+ * down, so a stray unlisted report can't switch typing off.
  */
 export function c4ModelType(device: Zh.Device | undefined, state?: KeyValue): C4ModelType | undefined {
-    const modelID = device?.modelID;
-    const identityModelID = typeof modelID === "string" && Object.hasOwn(C4_IDENTITY_MODELS, modelID) ? modelID : undefined;
-    const model = (device?.meta.c4_model as string | undefined) ?? (state?.c4_model as string | undefined) ?? identityModelID;
+    const candidates: unknown[] = [device?.meta.c4_model, state?.c4_model, device?.modelID];
+    const model = candidates.find((candidate): candidate is string => typeof candidate === "string" && Object.hasOwn(C4_IDENTITY_MODELS, candidate));
     const type = modelDeviceType(model);
     return type && model ? {model, type} : undefined;
 }

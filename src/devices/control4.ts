@@ -137,6 +137,10 @@ const fzControl4Identity = {
     type: ["attributeReport", "readResponse"],
     convert: (model, msg, publish, options, meta) => {
         if (msg.endpoint?.ID !== c4.C4_IDENTITY_ENDPOINT) return;
+        // Current herdsman messages don't carry the APS profile; when one
+        // does, anything but the identity profile isn't an identity frame.
+        const profile = (msg as {profileId?: unknown}).profileId ?? (msg.meta as {profileId?: unknown} | undefined)?.profileId;
+        if (profile !== undefined && profile !== c4.C4_IDENTITY_PROFILE) return;
         const identityState = c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
         const typeState = c4.applyC4ModelType(msg.device, meta.state);
         return identityState || typeState ? {...identityState, ...typeState} : undefined;
