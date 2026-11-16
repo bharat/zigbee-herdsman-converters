@@ -465,8 +465,14 @@ export const definitions: DefinitionWithExtend[] = [
         ],
         meta: {disableDefaultResponse: true},
         // Arm the self-heal probe campaign for quiet assumed-keypads at
-        // startup (the light() extend adds no onEvent).
+        // startup (the light() extend adds no onEvent), and drop the device's
+        // timers and campaign on "stop", which Zigbee2MQTT sends when the
+        // device leaves the network or is removed.
         onEvent: (event) => {
+            if (event.type === "stop") {
+                c4.clearC4DeviceState(event.data.ieeeAddr);
+                return;
+            }
             if (event.type !== "start") return;
             c4.c4ArmProbeOnStart(event.data.device, event.data.state);
         },
@@ -534,5 +540,9 @@ export const definitions: DefinitionWithExtend[] = [
             },
         ],
         meta: {disableDefaultResponse: true},
+        // Drop the debounced read and load timers when the outlet leaves or is removed.
+        onEvent: (event) => {
+            if (event.type === "stop") c4.clearC4DeviceState(event.data.ieeeAddr);
+        },
     },
 ];

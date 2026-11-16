@@ -100,7 +100,7 @@ export function applyC4Identity(device: Zh.Device | undefined, identity: C4Ident
             device.softwareBuildID = identity.firmware;
             dirty = true;
         }
-        if (dirty) device.save();
+        if (dirty) saveC4Device(device);
     }
     return Object.keys(changed).length > 0 ? changed : undefined;
 }
@@ -890,6 +890,26 @@ const c4LoadStateTimers = new Map<string, C4LoadStateEntry>();
 const c4LastLsSeen = new Map<string, number>();
 
 /**
+ * True once herdsman has removed the device (it left the network or was
+ * removed by the user). Its save() then throws, so timers bail out instead.
+ */
+export function isC4DeviceGone(device: Zh.Device): boolean {
+    return device.isDeleted === true;
+}
+
+/** Save the device, logging rather than throwing; skipped for a removed device. Returns true when saved. */
+function saveC4Device(device: Zh.Device): boolean {
+    if (typeof device.save !== "function" || isC4DeviceGone(device)) return false;
+    try {
+        device.save();
+        return true;
+    } catch (err) {
+        logger.warning(`Saving ${device.ieeeAddr} failed: ${(err as Error).message}`, NS);
+        return false;
+    }
+}
+
+/**
  * Trailing-edge throttle of ls telemetry: each frame resets the timer, so the
  * final publish always carries the settled level and electrical readings.
  * Level 0 publishes OFF with no brightness key, preserving the last-on level.
@@ -905,10 +925,16 @@ export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level:
 
     const entry: C4LoadStateEntry = {level, timer: null};
     entry.timer = setTimeout(() => {
-        c4LoadStateTimers.delete(key);
-        const lvl = entry.level;
-        const loadState = lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"};
-        publish(telemetry ? {...loadState, ...telemetry} : loadState);
+        // A timer callback has no caller to catch for it: never let it throw.
+        try {
+            if (c4LoadStateTimers.get(key) === entry) c4LoadStateTimers.delete(key);
+            if (isC4DeviceGone(device)) return;
+            const lvl = entry.level;
+            const loadState = lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"};
+            publish(telemetry ? {...loadState, ...telemetry} : loadState);
+        } catch (err) {
+            logger.warning(`Load state publish failed for ${key}: ${(err as Error).message}`, NS);
+        }
     }, C4_LOAD_STATE_DEBOUNCE_MS);
 
     c4LoadStateTimers.set(key, entry);
@@ -931,6 +957,7 @@ export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: 
 
     const timer = setTimeout(async () => {
         c4StateReadTimers.delete(key);
+        if (isC4DeviceGone(device)) return;
 
         const lastLs = c4LastLsSeen.get(key);
         if (lastLs !== undefined && lastLs > scheduledAt) {
@@ -991,13 +1018,34 @@ function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
     if (fields.confidence !== undefined) device.meta.c4_type_confidence = fields.confidence;
     if (fields.dimCode !== undefined) device.meta.c4_dim_code = fields.dimCode;
     if (fields.silentProbes !== undefined) device.meta.c4_silent_probes = fields.silentProbes;
-    if (typeof device.save === "function") device.save();
+    saveC4Device(device);
 }
 
 function stopC4ProbeCampaign(device: Zh.Device): void {
     const campaign = c4ProbeCampaigns.get(device.ieeeAddr);
     if (campaign?.timer) clearTimeout(campaign.timer);
     c4ProbeCampaigns.delete(device.ieeeAddr);
+}
+
+/**
+ * Drop every timer and in-memory record kept for a device. Called on the
+ * definition's "stop" event, which Zigbee2MQTT sends when the device leaves
+ * the network or is removed, so nothing keeps running against a removed device.
+ */
+export function clearC4DeviceState(ieeeAddr: string): void {
+    const campaign = c4ProbeCampaigns.get(ieeeAddr);
+    if (campaign?.timer) clearTimeout(campaign.timer);
+    c4ProbeCampaigns.delete(ieeeAddr);
+
+    const readTimer = c4StateReadTimers.get(ieeeAddr);
+    if (readTimer) clearTimeout(readTimer);
+    c4StateReadTimers.delete(ieeeAddr);
+
+    const loadEntry = c4LoadStateTimers.get(ieeeAddr);
+    if (loadEntry?.timer) clearTimeout(loadEntry.timer);
+    c4LoadStateTimers.delete(ieeeAddr);
+
+    c4LastLsSeen.delete(ieeeAddr);
 }
 
 /** Reset all in-memory self-heal campaign state (for testing). */
@@ -1171,54 +1219,70 @@ export function scheduleC4ProbeCampaign(
     const campaign: C4ProbeCampaign = {silentCount: (device.meta.c4_silent_probes as number | undefined) ?? 0, timer: null};
     c4ProbeCampaigns.set(device.ieeeAddr, campaign);
 
+    // The campaign is live while it is still the one registered for this
+    // device and herdsman hasn't removed the device: a "stop" event (leave or
+    // removal) clears the registration, and a removed device's save() throws.
+    const ieeeAddr = device.ieeeAddr;
+    const isLive = (): boolean => c4ProbeCampaigns.get(ieeeAddr) === campaign && !isC4DeviceGone(device);
+    const end = (): void => {
+        if (c4ProbeCampaigns.get(ieeeAddr) === campaign) c4ProbeCampaigns.delete(ieeeAddr);
+    };
+
+    // Runs from a timer, where nothing catches a rejection (and an unhandled
+    // rejection ends the Zigbee2MQTT process), so it must never throw.
     const runProbe = async (): Promise<void> => {
         campaign.timer = null;
-
-        let outcome: C4DimProbeOutcome;
         try {
-            outcome = normalizeProbeOutcome(await probeFn(device));
+            if (!isLive()) return end();
+
+            let outcome: C4DimProbeOutcome;
+            try {
+                outcome = normalizeProbeOutcome(await probeFn(device));
+            } catch (err) {
+                logger.warning(`Probe failed for ${ieeeAddr}: ${(err as Error).message}`, NS);
+                outcome = {kind: "silent"};
+            }
+
+            // The device may have left or been removed while the probe was out.
+            if (!isLive()) return end();
+
+            // The model may have become known since the campaign started; once
+            // it is, it decides the type and the probe answer no longer matters.
+            if (c4ModelType(device)) {
+                applyC4ModelType(device, {c4_device_type: deviceType}, publish);
+                return end();
+            }
+
+            if (outcome.kind === "heal") {
+                // The dim response also flows through the raw fromZigbee handler;
+                // applyC4Heal is idempotent so both paths can observe the answer.
+                applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
+                return end();
+            }
+
+            if (outcome.kind === "negative") {
+                // An explicit no-load answer is proof, not silence: confirm now
+                // instead of burning the silent-probe budget.
+                markConfirmedC4Keypad(device, publish, {
+                    logReason: "keypad confirmed by explicit n01 answer",
+                    evidence: "explicit n01 answer",
+                });
+                return end();
+            }
+
+            campaign.silentCount += 1;
+            persistC4Meta(device, {silentProbes: campaign.silentCount});
+
+            if (campaign.silentCount >= C4_MAX_SILENT_PROBES) {
+                markConfirmedC4Keypad(device, publish);
+                return end();
+            }
+
+            campaign.timer = setTimeout(runProbe, backoffMs * 2 ** (campaign.silentCount - 1));
         } catch (err) {
-            logger.warning(`Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
-            outcome = {kind: "silent"};
+            logger.warning(`Probe campaign for ${ieeeAddr} stopped: ${(err as Error).message}`, NS);
+            end();
         }
-
-        // The model may have become known since the campaign started; once
-        // it is, it decides the type and the probe answer no longer matters.
-        if (c4ModelType(device)) {
-            applyC4ModelType(device, {c4_device_type: deviceType}, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        if (outcome.kind === "heal") {
-            // The dim response also flows through the raw fromZigbee handler;
-            // applyC4Heal is idempotent so both paths can observe the answer.
-            applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        if (outcome.kind === "negative") {
-            // An explicit no-load answer is proof, not silence: confirm now
-            // instead of burning the silent-probe budget.
-            markConfirmedC4Keypad(device, publish, {
-                logReason: "keypad confirmed by explicit n01 answer",
-                evidence: "explicit n01 answer",
-            });
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        campaign.silentCount += 1;
-        persistC4Meta(device, {silentProbes: campaign.silentCount});
-
-        if (campaign.silentCount >= C4_MAX_SILENT_PROBES) {
-            markConfirmedC4Keypad(device, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        campaign.timer = setTimeout(runProbe, backoffMs * 2 ** (campaign.silentCount - 1));
     };
 
     campaign.timer = setTimeout(runProbe, Math.floor(random() * initialMaxMs));
