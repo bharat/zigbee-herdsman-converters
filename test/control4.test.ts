@@ -712,10 +712,11 @@ describe("Control4 protocol", () => {
         });
 
         it.each(["constructor", "__proto__", "toString", "hasOwnProperty"])(
-            "files the inherited property name %s under keypaddim, like any unlisted code",
+            "never resolves the inherited property name %s, and doesn't take it as a dim answer",
             (code) => {
                 expect(dimCodeType(code)).toBeUndefined();
-                expect(classifyDeviceType(`0r0001 000 c4.dmx.dim ${code}`)).toBe("keypaddim");
+                // Dim codes are two hex digits; anything else is no dim answer at all.
+                expect(classifyDeviceType(`0r0001 000 c4.dmx.dim ${code}`)).toBe("keypad");
             },
         );
     });

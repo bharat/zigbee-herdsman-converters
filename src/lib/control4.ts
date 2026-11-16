@@ -344,22 +344,26 @@ export function formatGetCommand(seq: string, cmdBody: string): string {
     return `0g${seq} ${cmdBody}\r\n`;
 }
 
+// Reply parsers match the whole reply frame, "0r<seq> 000 <command> <data>",
+// so a command name or status appearing inside some other frame (telemetry,
+// or a reply to a different command) is never read as an answer.
+
 /** Parse LED color from response: "0r<seq> 000 c4.dmx.led <RRGGBB>" → hex string or null */
 export function parseLedColorResponse(responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dmx\.led ([0-9a-fA-F]{6})/);
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dmx\.led ([0-9a-fA-F]{6})\s*$/);
     return match ? match[1].toLowerCase() : null;
 }
 
-/** Parse dimmer type from response: "0r<seq> 000 c4.dmx.dim <XX>" → type code or null */
+/** Parse dimmer type from response: "0r<seq> 000 c4.dmx.dim <XX>" → two-hex-digit type code or null */
 export function parseDimResponse(responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dmx\.dim (\w+)/);
-    return match ? match[1] : null;
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dmx\.dim ([0-9a-fA-F]{2})\s*$/);
+    return match ? match[1].toLowerCase() : null;
 }
 
 export function parseResponseSeq(text: string): string | null {
-    const match = text.match(/^0r(\w{4})\s/);
+    const match = text.match(/^0r([0-9a-fA-F]{4})\s/);
     return match ? match[1] : null;
 }
 
@@ -615,7 +619,7 @@ export const C4_DIMMING_PARAMS = ["01", "02", "03", "04", "05", "06", "08", "09"
 /** Parse a dimming table reply, "0r<seq> 000 c4.dm.tv 02ee" → 750, or null. */
 export function parseDimmingResponse(responseText?: string | null): number | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dm\.tv ([0-9a-fA-F]+)$/);
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dm\.tv ([0-9a-fA-F]{1,8})\s*$/);
     return match ? Number.parseInt(match[1], 16) : null;
 }
 
@@ -723,7 +727,7 @@ export function classifyDeviceType(dimResponseText?: string | null): C4DeviceTyp
  */
 export function isC4DimNegativeResponse(rawText?: string | null): boolean {
     if (!rawText) return false;
-    return /\bn01\b/.test(rawText) || /^0r\w+\s+v\d{2}\b/.test(rawText);
+    return /^0r[0-9a-fA-F]{4}\s+(?:n01|v\d{2})(?:\s|$)/.test(rawText);
 }
 
 export interface C4DimProbeOutcome {
@@ -1041,7 +1045,7 @@ export const LED_MODE_FROM_FIRMWARE: Record<string, string> = {
  */
 export function parseParamResponse(cmd: "led" | "btn", responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(new RegExp(`000 c4\\.dmx\\.${cmd} ([0-9a-fA-F]{1,2})$`));
+    const match = responseText.match(new RegExp(`^0r[0-9a-fA-F]{4}\\s+000 c4\\.dmx\\.${cmd} ([0-9a-fA-F]{1,2})\\s*$`));
     if (!match) return null;
     return match[1].toLowerCase().padStart(2, "0");
 }

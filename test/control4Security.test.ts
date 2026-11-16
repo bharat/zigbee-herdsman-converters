@@ -726,4 +726,47 @@ describe("Control4 security hardening", () => {
             await expect(fresh).resolves.toBe(2);
         });
     });
+
+    describe("reply frame anchoring", () => {
+        it.each([
+            ["telemetry carrying a reply fragment", "0t0001 sa c4.dmx.ls 000 c4.dmx.dim 01"],
+            ["a reply with trailing junk", "0r0001 000 c4.dmx.dim 01 extra"],
+            ["a long code", "0r0001 000 c4.dmx.dim 0102"],
+            ["a malformed sequence", "0rzzzz 000 c4.dmx.dim 01"],
+        ])("parseDimResponse ignores %s", (_label, frame) => {
+            expect(c4.parseDimResponse(frame)).toBeNull();
+        });
+
+        it("still parses real replies", () => {
+            expect(c4.parseDimResponse("0ra9c8 000 c4.dmx.dim 01")).toBe("01");
+            expect(c4.parseDimResponse("0r0001  000 c4.dmx.dim 02\r\n")).toBe("02");
+            expect(c4.parseLedColorResponse("0ra9c8 000 c4.dmx.led ffffff")).toBe("ffffff");
+            expect(c4.parseDimmingResponse("0r62ac 000 c4.dm.tv 02ee")).toBe(750);
+            expect(c4.parseParamResponse("btn", "0r0001 000 c4.dmx.btn 03")).toBe("03");
+            expect(c4.isC4DimNegativeResponse("0r0001 n01")).toBe(true);
+            expect(c4.isC4DimNegativeResponse("0r0001 v01")).toBe(true);
+        });
+
+        it("the no-load marker only counts in the status position of a reply", () => {
+            expect(c4.isC4DimNegativeResponse("0t0001 sa c4.dmx.x n01")).toBe(false);
+            expect(c4.isC4DimNegativeResponse("0r0001 000 c4.dmx.led n01")).toBe(false);
+            expect(c4.isC4DimNegativeResponse("0r0001 n012")).toBe(false);
+        });
+
+        it("other replies are anchored too", () => {
+            expect(c4.parseLedColorResponse("0t0001 sa x 000 c4.dmx.led ffffff")).toBeNull();
+            expect(c4.parseLedColorResponse("0r0001 000 c4.dmx.led ffffff00")).toBeNull();
+            expect(c4.parseDimmingResponse("0t0001 000 c4.dm.tv 02ee")).toBeNull();
+            expect(c4.parseDimmingResponse("0r0001 000 c4.dm.tv 1234567890")).toBeNull();
+            expect(c4.parseParamResponse("led", "0t0001 sa 000 c4.dmx.led 02")).toBeNull();
+            expect(c4.parseResponseSeq("0rzzzz 000")).toBeNull();
+        });
+
+        it("a dim fragment inside telemetry doesn't heal the device type", async () => {
+            const {device} = makeDevice("0x5EA1", {c4_device_type: "keypad"});
+            const result = await raw("0t0001 sa c4.dmx.xx 000 c4.dmx.dim 01", device, {c4_device_type: "keypad"});
+            expect(result?.c4_device_type).toBeUndefined();
+            expect(device.meta.c4_device_type).toBe("keypad");
+        });
+    });
 });
