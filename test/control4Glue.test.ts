@@ -851,7 +851,7 @@ describe("Control4 glue", () => {
                         const answer = respond(cmdBody);
                         // null answer = silence: let the query time out
                         if (answer !== null) {
-                            queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                            queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`, ieeeAddr));
                         }
                     }
                     return Promise.resolve();
@@ -1041,8 +1041,21 @@ describe("Control4 glue", () => {
             expect(await turnOn(endpoint(new Error("timeout")))).toEqual({state: {state: "ON"}});
         });
 
-        it("doesn't poll: the button reports through the C4 text protocol", () => {
-            expect(definition.onEvent).toBeUndefined();
+        it("doesn't poll: the button reports through the C4 text protocol", async () => {
+            // onEvent only clears per-device timers on "stop"; start arms nothing.
+            vi.useFakeTimers();
+            try {
+                const {device, ep1} = makeDevice("0x0D0F");
+                await definition.onEvent?.({
+                    type: "start",
+                    data: {device: asDevice(device), state: {}, options: {}, deviceExposesChanged: () => {}},
+                });
+                await vi.advanceTimersByTimeAsync(600000);
+                expect(ep1.read).not.toHaveBeenCalled();
+                expect(vi.getTimerCount()).toBe(0);
+            } finally {
+                vi.useRealTimers();
+            }
             expect(definition.options.map((option) => option.name)).not.toContain("state_poll_interval");
         });
 
@@ -1235,7 +1248,7 @@ describe("Control4 glue", () => {
                 if (match) {
                     const [, seq, cmdBody] = match;
                     const answer = cmdBody === "c4.dmx.dim" ? (dimCode === null ? null : `000 c4.dmx.dim ${dimCode}`) : "000 c4.dmx.led ffffff";
-                    if (answer !== null) queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`));
+                    if (answer !== null) queueMicrotask(() => resolveC4PendingQuery(seq, `0r${seq} ${answer}`, ieeeAddr));
                 }
                 return Promise.resolve();
             });

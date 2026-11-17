@@ -39,10 +39,10 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
             if (!text) return;
 
             const epId = msg.endpoint?.ID ?? "?";
-            logger.debug(`Received EP ${epId}: ${text}`, NS);
+            logger.debug(`Received EP ${epId}: ${c4.c4LogText(text)}`, NS);
 
             const respSeq = c4.parseResponseSeq(text);
-            if (respSeq && c4.resolveC4PendingQuery(respSeq, text)) {
+            if (respSeq && c4.resolveC4PendingQuery(respSeq, text, msg.device?.ieeeAddr)) {
                 logger.debug(`Resolved pending query seq ${respSeq}`, NS);
             }
 
@@ -99,7 +99,7 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
                 return result;
             }
 
-            const loadStatus = c4.parseLoadStatus(text);
+            const loadStatus = c4.parseLoadStatus(text, msg.device?.ieeeAddr);
             if (loadStatus) {
                 logger.debug(`${c4.c4DeviceLabel(msg.device)} Load level ${loadStatus.level}%`, NS);
 
@@ -137,11 +137,37 @@ const fzControl4Identity = {
     type: ["attributeReport", "readResponse"],
     convert: (model, msg, publish, options, meta) => {
         if (msg.endpoint?.ID !== c4.C4_IDENTITY_ENDPOINT) return;
+        // Current herdsman messages don't carry the APS profile; when one
+        // does, anything but the identity profile isn't an identity frame.
+        const profile = (msg as {profileId?: unknown}).profileId ?? (msg.meta as {profileId?: unknown} | undefined)?.profileId;
+        if (profile !== undefined && profile !== c4.C4_IDENTITY_PROFILE) return;
         const identityState = c4.applyC4Identity(msg.device, c4.parseC4Identity(msg.data as KeyValue), meta.state);
         const typeState = c4.applyC4ModelType(msg.device, meta.state);
         return identityState || typeState ? {...identityState, ...typeState} : undefined;
     },
 } satisfies Fz.Converter<"genPowerCfg", undefined, ["attributeReport", "readResponse"]>;
+
+/**
+ * Resolve a c4_led LED or mode given by name (an own key of `table`) or as a
+ * raw wire code, and return the code, which must be 00-05. Anything else
+ * throws, so no text beyond a two-digit code reaches the command.
+ */
+function c4LedCode(table: Record<string, string>, value: unknown, what: string): string {
+    if (typeof value !== "string" && typeof value !== "number") throw new Error(`Invalid ${what}: expected a name or a 2-digit code`);
+    const name = String(value);
+    const code = Object.hasOwn(table, name) ? table[name] : name;
+    if (!/^0[0-5]$/.test(code)) throw new Error(`Invalid ${what} ${c4.c4LogText(name)}: expected one of ${Object.keys(table).join(", ")} or 00-05`);
+    return code;
+}
+
+/** Normalize and validate a c4_led color, throwing on anything but 6 hex digits. */
+function c4LedColor(color: unknown): string {
+    const colorHex = typeof color === "string" || typeof color === "number" ? c4.normalizeColorHex(String(color)) : "";
+    if (!c4.isValidColorHex(colorHex)) {
+        throw new Error(`Invalid color ${c4.c4LogText(String(color))}, expected 6-digit hex RGB like "ff0000"`);
+    }
+    return colorHex;
+}
 
 // Set LED colors, single ({"c4_led": {"led": "top", "color": "ff0000", "mode": "on"}})
 // or batch ({"c4_led": {"top_on": "ffffff", "bottom_off": "0000ff", ...}}).
@@ -149,53 +175,43 @@ const tzControl4Led = {
     key: ["c4_led"],
     convertSet: async (entity, key, value, meta) => {
         if (!meta.device) throw new Error("c4_led requires a device");
-        const val = value as KeyValue;
+        const val = (value ?? {}) as KeyValue;
         const state: KeyValue = {};
 
         if (val.top_on !== undefined || val.top_off !== undefined || val.bottom_on !== undefined || val.bottom_off !== undefined) {
-            const commands: [string, string, unknown][] = [
-                ["01", "03", val.top_on],
-                ["01", "04", val.top_off],
-                ["04", "03", val.bottom_on],
-                ["04", "04", val.bottom_off],
+            const commands: [string, string, unknown, string][] = [
+                ["01", "03", val.top_on, "c4_top_led_on"],
+                ["01", "04", val.top_off, "c4_top_led_off"],
+                ["04", "03", val.bottom_on, "c4_bottom_led_on"],
+                ["04", "04", val.bottom_off, "c4_bottom_led_off"],
             ];
 
-            for (const [ledId, mode, color] of commands) {
-                if (color === undefined) continue;
-                const colorHex = c4.normalizeColorHex(String(color));
-                if (!c4.isValidColorHex(colorHex)) {
-                    throw new Error(`Invalid color "${color}", expected 6-digit hex RGB`);
-                }
+            // Validate every color before sending any, so a bad one leaves the LEDs untouched.
+            const valid = commands
+                .filter(([, , color]) => color !== undefined)
+                .map(([ledId, mode, color, stateKey]) => [ledId, mode, c4LedColor(color), stateKey]);
+            for (const [ledId, mode, colorHex, stateKey] of valid) {
                 await c4.sendC4(meta.device, `c4.dmx.led ${ledId} ${mode} ${colorHex}`);
+                state[stateKey] = colorHex;
             }
-
-            if (val.top_on) state.c4_top_led_on = val.top_on;
-            if (val.top_off) state.c4_top_led_off = val.top_off;
-            if (val.bottom_on) state.c4_bottom_led_on = val.bottom_on;
-            if (val.bottom_off) state.c4_bottom_led_off = val.bottom_off;
 
             return {state};
         }
 
-        const led = (val.led as string | undefined) ?? "top";
-        const color = val.color as string | undefined;
-        const mode = (val.mode as string | undefined) ?? "on";
+        const led = val.led ?? "top";
+        const mode = val.mode ?? "on";
 
-        if (!color) {
+        if (!val.color) {
             throw new Error('c4_led requires "color" (6-digit hex RGB) or batch keys (top_on, top_off, etc.)');
         }
 
-        const ledId = c4.LED_IDS[led] ?? led;
-        const colorHex = c4.normalizeColorHex(color);
-
-        if (!c4.isValidColorHex(colorHex)) {
-            throw new Error(`Invalid color "${color}", expected 6-digit hex RGB like "ff0000"`);
-        }
-
-        const modeCode = c4.LED_MODES[mode] ?? mode;
+        const ledId = c4LedCode(c4.LED_IDS, led, "LED");
+        const modeCode = c4LedCode(c4.LED_MODES, mode, "LED mode");
+        const colorHex = c4LedColor(val.color);
 
         await c4.sendC4(meta.device, `c4.dmx.led ${ledId} ${modeCode} ${colorHex}`);
-        state[`c4_led_${led}_${mode}`] = colorHex;
+        // Both parts passed c4LedCode: a known name or a 00-05 code.
+        state[`c4_led_${String(led)}_${String(mode)}`] = colorHex;
 
         return {state};
     },
@@ -235,10 +251,13 @@ const tzControl4Query = {
         }
 
         const sent = await c4.queryC4(meta.device, value);
-        logger.debug(`Query sent: ${sent}`, NS);
+        logger.debug(`Query sent: ${c4.c4LogText(sent)}`, NS);
         return {state: {c4_last_query: sent}};
     },
 } satisfies Tz.Converter;
+
+/** Most attributes one zcl_read may ask for; a failed batch falls back to one read (10 s timeout) each. */
+const ZCL_READ_MAX_ATTRIBUTES = 32;
 
 // Read arbitrary ZCL attributes for device interrogation; results are
 // published as probe_result.
@@ -258,8 +277,14 @@ const tzControl4ZclRead = {
             attributes = [...c4.GENBASIC_ATTRS];
         }
 
-        if (!attributes || attributes.length === 0) {
+        if (!Array.isArray(attributes) || attributes.length === 0) {
             throw new Error('zcl_read requires "attributes" array (or use cluster "genBasic" for defaults)');
+        }
+        if (attributes.length > ZCL_READ_MAX_ATTRIBUTES) {
+            throw new Error(`zcl_read reads at most ${ZCL_READ_MAX_ATTRIBUTES} attributes, got ${attributes.length}`);
+        }
+        if (!attributes.every((attr) => typeof attr === "string" || typeof attr === "number")) {
+            throw new Error("zcl_read attributes must be names or numeric ids");
         }
 
         logger.info(`Reading EP ${epId} cluster ${cluster}: ${JSON.stringify(attributes)}`, NS);
@@ -339,34 +364,36 @@ const tzControl4Detect = {
         const device = meta.device;
         if (!device) throw new Error("c4_detect requires a device");
 
-        const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
-        const colorState = await c4.readStoredColors(device, deviceType);
+        return await c4.withC4InFlightGuard(device, "c4_detect", async () => {
+            const {deviceType, dimCode, confidence, model} = await c4.detectDeviceType(device);
+            const colorState = await c4.readStoredColors(device, deviceType);
 
-        const state: KeyValue = {
-            c4_device_type: deviceType,
-            ...colorState,
-        };
+            const state: KeyValue = {
+                c4_device_type: deviceType,
+                ...colorState,
+            };
 
-        // A detect that times out yields an assumed keypad, which the active
-        // probe campaign may later confirm or heal.
-        device.meta.c4_device_type = deviceType;
-        device.meta.c4_type_confidence = confidence;
-        device.meta.c4_dim_code = dimCode ?? null;
-        device.save();
+            // A detect that times out yields an assumed keypad, which the active
+            // probe campaign may later confirm or heal.
+            device.meta.c4_device_type = deviceType;
+            device.meta.c4_type_confidence = confidence;
+            device.meta.c4_dim_code = dimCode ?? null;
+            device.save();
 
-        state.c4_detect_result = {
-            ieee_address: device.ieeeAddr,
-            device_type: deviceType,
-            confidence,
-            dim_code: dimCode ?? null,
-            model: model ?? c4.MODEL_NAMES[deviceType] ?? "unknown",
-            description: c4.MODEL_DESCRIPTIONS[deviceType] ?? "Unknown Control4 device",
-            colors_read: Object.keys(colorState).length,
-            ...(model ? {evidence: `reported model ${model}`} : {}),
-        };
+            state.c4_detect_result = {
+                ieee_address: device.ieeeAddr,
+                device_type: deviceType,
+                confidence,
+                dim_code: dimCode ?? null,
+                model: model ?? c4.MODEL_NAMES[deviceType] ?? "unknown",
+                description: c4.MODEL_DESCRIPTIONS[deviceType] ?? "Unknown Control4 device",
+                colors_read: Object.keys(colorState).length,
+                ...(model ? {evidence: `reported model ${model}`} : {}),
+            };
 
-        logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
-        return {state};
+            logger.info(`Detection complete: ${JSON.stringify(state.c4_detect_result)}`, NS);
+            return {state};
+        });
     },
 } satisfies Tz.Converter;
 
@@ -387,13 +414,17 @@ const tzControl4VerifySlot = {
             throw new Error(`c4_verify_slot expects a slot id 1-${c4.BUTTONS.length}, got "${value}"`);
         }
 
-        const observed = await c4.readStoredSlotConfig(meta.device, slotId);
-        logger.debug(`${c4.c4DeviceLabel(meta.device)} verify slot ${slotId}: ${JSON.stringify(observed)}`, NS);
+        const device = meta.device;
+        // One read per slot at a time; different slots stay independent.
+        await c4.withC4InFlightGuard(device, `c4_verify_slot:${slotId}`, async () => {
+            const observed = await c4.readStoredSlotConfig(device, slotId);
+            logger.debug(`${c4.c4DeviceLabel(device)} verify slot ${slotId}: ${JSON.stringify(observed)}`, NS);
 
-        // Publish directly (rather than returning state) so the marker clear
-        // is guaranteed to follow the verify payload in order.
-        meta.publish({...observed, c4_verified_slot: slotId});
-        meta.publish({c4_verified_slot: null});
+            // Publish directly (rather than returning state) so the marker clear
+            // is guaranteed to follow the verify payload in order.
+            meta.publish({...observed, c4_verified_slot: slotId});
+            meta.publish({c4_verified_slot: null});
+        });
     },
 } satisfies Tz.Converter;
 
@@ -420,7 +451,8 @@ const tzControl4ReadDimming = {
     convertSet: async (entity, key, value, meta) => {
         if (!meta.device) throw new Error("c4_read_dimming requires a device");
         // Publish directly, as c4_verify_slot does: Z2M doesn't publish state returned from this command.
-        meta.publish(await c4.readDimmingTable(meta.device));
+        const device = meta.device;
+        meta.publish(await c4.withC4InFlightGuard(device, "c4_read_dimming", () => c4.readDimmingTable(device)));
     },
 } satisfies Tz.Converter;
 
@@ -465,8 +497,14 @@ export const definitions: DefinitionWithExtend[] = [
         ],
         meta: {disableDefaultResponse: true},
         // Arm the self-heal probe campaign for quiet assumed-keypads at
-        // startup (the light() extend adds no onEvent).
+        // startup (the light() extend adds no onEvent), and drop the device's
+        // timers and campaign on "stop", which Zigbee2MQTT sends when the
+        // device leaves the network or is removed.
         onEvent: (event) => {
+            if (event.type === "stop") {
+                c4.clearC4DeviceState(event.data.ieeeAddr);
+                return;
+            }
             if (event.type !== "start") return;
             c4.c4ArmProbeOnStart(event.data.device, event.data.state);
         },
@@ -489,7 +527,7 @@ export const definitions: DefinitionWithExtend[] = [
             try {
                 const identity = await c4.readC4Identity(device);
                 c4.applyC4Identity(device, identity, undefined);
-                logger.info(`Identity: ${identity.model ?? "?"} firmware ${identity.firmware ?? "?"}`, NS);
+                logger.info(`Identity: ${c4.c4LogText(identity.model ?? "?")} firmware ${c4.c4LogText(identity.firmware ?? "?")}`, NS);
             } catch (err) {
                 logger.info(`Identity read failed (the periodic report will fill it in): ${(err as Error).message}`, NS);
             }
@@ -534,5 +572,9 @@ export const definitions: DefinitionWithExtend[] = [
             },
         ],
         meta: {disableDefaultResponse: true},
+        // Drop the debounced read and load timers when the outlet leaves or is removed.
+        onEvent: (event) => {
+            if (event.type === "stop") c4.clearC4DeviceState(event.data.ieeeAddr);
+        },
     },
 ];

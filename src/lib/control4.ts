@@ -58,19 +58,73 @@ export interface C4Identity {
     firmware?: string;
 }
 
-/** Extract model and firmware from an identity report or read response (keyed by raw attribute ID). */
+/** Shape an unlisted reported model must have to be stored or published. */
+const C4_MODEL_NAME = /^[A-Za-z0-9-]{1,32}$/;
+
+/** Shape a reported firmware version must have: printable ASCII, at most 32 characters. */
+const C4_FIRMWARE_VERSION = /^[\x20-\x7e]{1,32}$/;
+
+/** True for a model name that may be stored: a listed model, or a short plain name. */
+export function isAcceptableC4Model(model: string): boolean {
+    return Object.hasOwn(C4_IDENTITY_MODELS, model) || C4_MODEL_NAME.test(model);
+}
+
+/**
+ * Extract model and firmware from an identity report or read response (keyed
+ * by raw attribute ID). A model that is neither listed nor a short plain name,
+ * or a firmware string with control characters, is dropped.
+ */
 export function parseC4Identity(data: KeyValue): C4Identity {
     const identity: C4Identity = {};
     const model = data[C4_ATTR_MODEL];
     if (typeof model === "string") {
         // "c4:control4_light:C4-APD120" -> "C4-APD120"
-        identity.model = /^c4:[^:]*:(.+)$/.exec(model)?.[1] ?? model;
+        const name = /^c4:[^:]*:(.+)$/.exec(model)?.[1] ?? model;
+        if (isAcceptableC4Model(name)) identity.model = name;
+        else logger.debug(`Ignoring malformed reported model ${JSON.stringify(model.slice(0, 64))}`, NS);
     }
     const firmware = data[C4_ATTR_FIRMWARE];
     if (typeof firmware === "string") {
-        identity.firmware = firmware;
+        if (C4_FIRMWARE_VERSION.test(firmware)) identity.firmware = firmware;
+        else logger.debug(`Ignoring malformed reported firmware ${JSON.stringify(firmware.slice(0, 64))}`, NS);
     }
     return identity;
+}
+
+/**
+ * Minimum time between two persisted identity changes (firmware, or an
+ * unlisted model) or two dim-answer type heals for one device. Each persist
+ * rewrites the whole herdsman database, so a device flipping its reports
+ * must not be able to force a write per frame.
+ */
+export const C4_PERSIST_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+const c4LastIdentityPersist = new Map<string, number>();
+const c4LastDimHealPersist = new Map<string, number>();
+
+/** True when `ieeeAddr` hasn't persisted through `map` within C4_PERSIST_MIN_INTERVAL_MS. */
+function c4PersistDue(map: Map<string, number>, ieeeAddr: string): boolean {
+    const last = map.get(ieeeAddr);
+    return last === undefined || Date.now() - last >= C4_PERSIST_MIN_INTERVAL_MS;
+}
+
+/** Most entries any once-per-key log guard keeps, so hostile input can't grow it without bound. */
+const C4_LOG_GUARD_MAX = 256;
+
+/** Record `key` in a bounded once-only log guard; true the first time it is seen. */
+function c4FirstTime(guard: Set<string | number>, key: string | number): boolean {
+    if (guard.has(key)) return false;
+    if (guard.size >= C4_LOG_GUARD_MAX) guard.clear();
+    guard.add(key);
+    return true;
+}
+
+const loggedModelConflicts = new Set<string | number>();
+
+/** The listed model already stored for a device, which later reports can't replace. */
+function lockedC4Model(device: Zh.Device): string | undefined {
+    const model = device.meta.c4_model;
+    return typeof model === "string" && Object.hasOwn(C4_IDENTITY_MODELS, model) ? model : undefined;
 }
 
 /**
@@ -79,29 +133,64 @@ export function parseC4Identity(data: KeyValue): C4Identity {
  * return the c4_model /
  * c4_firmware state that changed, or undefined when nothing did (the
  * identity report repeats about once a minute).
+ *
+ * Once a listed model is stored it is kept: a different model reported
+ * later is ignored (logged once per device). Other identity changes are
+ * persisted at most once per C4_PERSIST_MIN_INTERVAL_MS per device; the
+ * first value, and a first listed model, are always taken.
  */
 export function applyC4Identity(device: Zh.Device | undefined, identity: C4Identity, state: KeyValue | undefined): KeyValue | undefined {
-    const changed: KeyValue = {};
-    if (identity.model && state?.c4_model !== identity.model) changed.c4_model = identity.model;
-    if (identity.firmware && state?.c4_firmware !== identity.firmware) changed.c4_firmware = identity.firmware;
+    let model = identity.model;
+    let firmware = identity.firmware;
 
     if (device) {
+        const ieeeAddr = device.ieeeAddr;
+        const locked = lockedC4Model(device);
+        if (model && locked && model !== locked) {
+            if (c4FirstTime(loggedModelConflicts, ieeeAddr)) {
+                logger.warning(`${ieeeAddr}: ignoring reported model ${JSON.stringify(model)}, already identified as ${locked}`, NS);
+            }
+            model = undefined;
+        }
+
+        const modelChanges = model !== undefined && device.meta.c4_model !== model;
+        const firmwareChanges = firmware !== undefined && (device.meta.c4_firmware !== firmware || device.softwareBuildID !== firmware);
+        // The first model, and the first listed one, are taken at once; so is the first firmware.
+        const modelFree = model !== undefined && (device.meta.c4_model === undefined || (!locked && Object.hasOwn(C4_IDENTITY_MODELS, model)));
+        const firmwareFree = device.meta.c4_firmware === undefined;
+        const due = c4PersistDue(c4LastIdentityPersist, ieeeAddr);
+        if (modelChanges && !modelFree && !due) {
+            logger.debug(`${ieeeAddr}: model change to ${JSON.stringify(model)} deferred (rate limited)`, NS);
+            model = undefined;
+        }
+        if (firmwareChanges && !firmwareFree && !due) {
+            logger.debug(`${ieeeAddr}: firmware change to ${JSON.stringify(firmware)} deferred (rate limited)`, NS);
+            firmware = undefined;
+        }
+
         let dirty = false;
-        if (identity.model && device.meta.c4_model !== identity.model) {
-            device.meta.c4_model = identity.model;
+        if (model && device.meta.c4_model !== model) {
+            device.meta.c4_model = model;
             dirty = true;
         }
-        if (identity.model && Object.hasOwn(C4_IDENTITY_MODELS, identity.model) && device.modelID !== identity.model) {
-            device.modelID = identity.model;
+        if (model && Object.hasOwn(C4_IDENTITY_MODELS, model) && device.modelID !== model) {
+            device.modelID = model;
             dirty = true;
         }
-        if (identity.firmware && (device.meta.c4_firmware !== identity.firmware || device.softwareBuildID !== identity.firmware)) {
-            device.meta.c4_firmware = identity.firmware;
-            device.softwareBuildID = identity.firmware;
+        if (firmware && (device.meta.c4_firmware !== firmware || device.softwareBuildID !== firmware)) {
+            device.meta.c4_firmware = firmware;
+            device.softwareBuildID = firmware;
             dirty = true;
         }
-        if (dirty) device.save();
+        if (dirty) {
+            saveC4Device(device);
+            c4LastIdentityPersist.set(ieeeAddr, Date.now());
+        }
     }
+
+    const changed: KeyValue = {};
+    if (model && state?.c4_model !== model) changed.c4_model = model;
+    if (firmware && state?.c4_firmware !== firmware) changed.c4_firmware = firmware;
     return Object.keys(changed).length > 0 ? changed : undefined;
 }
 
@@ -255,26 +344,31 @@ export function formatGetCommand(seq: string, cmdBody: string): string {
     return `0g${seq} ${cmdBody}\r\n`;
 }
 
+// Reply parsers match the whole reply frame, "0r<seq> 000 <command> <data>",
+// so a command name or status appearing inside some other frame (telemetry,
+// or a reply to a different command) is never read as an answer.
+
 /** Parse LED color from response: "0r<seq> 000 c4.dmx.led <RRGGBB>" → hex string or null */
 export function parseLedColorResponse(responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dmx\.led (\w{6})/);
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dmx\.led ([0-9a-fA-F]{6})\s*$/);
     return match ? match[1].toLowerCase() : null;
 }
 
-/** Parse dimmer type from response: "0r<seq> 000 c4.dmx.dim <XX>" → type code or null */
+/** Parse dimmer type from response: "0r<seq> 000 c4.dmx.dim <XX>" → two-hex-digit type code or null */
 export function parseDimResponse(responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dmx\.dim (\w+)/);
-    return match ? match[1] : null;
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dmx\.dim ([0-9a-fA-F]{2})\s*$/);
+    return match ? match[1].toLowerCase() : null;
 }
 
 export function parseResponseSeq(text: string): string | null {
-    const match = text.match(/^0r(\w{4})\s/);
+    const match = text.match(/^0r([0-9a-fA-F]{4})\s/);
     return match ? match[1] : null;
 }
 
-const loggedUnknownWireIds = new Set<number>();
+// Bounded through c4FirstTime; every malformed id shares one key.
+const loggedUnknownWireIds = new Set<string | number>();
 
 /** Reset the once-per-wire-id unknown-id log guard (for testing). */
 export function resetC4ButtonLogState(): void {
@@ -295,24 +389,33 @@ export interface C4ButtonEvent {
     clickCount?: number;
 }
 
+/** A wire id as the dmx frames carry it: exactly two hex digits. */
+const C4_WIRE_ID = /^[0-9a-fA-F]{2}$/;
+
 /**
  * Map a bp/cc/sc wire id: 0x00-0x05 → button_1..6, 0x07/0x08 → paddle halves.
- * Other ids keep the legacy button_(N+1) mapping but are logged once.
+ * Anything else (another value, or not two hex digits) maps to nothing, so
+ * no action outside ACTION_VALUES is ever published; it is logged once.
  */
 export function resolveButtonTarget(wireIdHex: string): C4ButtonTarget | null {
-    const wireId = Number.parseInt(wireIdHex, 16);
-    if (Number.isNaN(wireId)) return null;
+    const wireId = C4_WIRE_ID.test(wireIdHex) ? Number.parseInt(wireIdHex, 16) : Number.NaN;
 
-    const paddle = PADDLE_WIRE_IDS[wireId];
+    const paddle = Object.hasOwn(PADDLE_WIRE_IDS, wireId) ? PADDLE_WIRE_IDS[wireId] : undefined;
     if (paddle) return {prefix: paddle, paddle};
 
-    if (wireId < 0x00 || wireId > 0x05) {
-        if (!loggedUnknownWireIds.has(wireId)) {
-            loggedUnknownWireIds.add(wireId);
-            logger.warning(`Unknown wire id 0x${wireId.toString(16).padStart(2, "0")}: not a button slot (0x00-0x05) or paddle half (0x07/0x08)`, NS);
-        }
+    if (wireId >= 0x00 && wireId <= 0x05) return {prefix: `button_${wireId + 1}`, buttonId: wireId + 1};
+
+    const known = !Number.isNaN(wireId);
+    if (c4FirstTime(loggedUnknownWireIds, known ? wireId : "malformed")) {
+        const shown = known ? `0x${wireIdHex.toLowerCase()}` : "(malformed)";
+        logger.warning(`Unknown wire id ${shown}: not a button slot (0x00-0x05) or paddle half (0x07/0x08), ignored`, NS);
     }
-    return {prefix: `button_${wireId + 1}`, buttonId: wireId + 1};
+    return null;
+}
+
+/** A click count: one or two hex digits, else null. */
+function parseClickCount(countHex: string): number | null {
+    return /^[0-9a-fA-F]{1,2}$/.test(countHex) ? Number.parseInt(countHex, 16) : null;
 }
 
 function targetIdentity(target: C4ButtonTarget): {paddle: string} | {buttonId: number | undefined} {
@@ -330,9 +433,9 @@ export const LEGACY_DM_PADDLE_IDS: Record<number, string> = {
 };
 
 function resolveLegacyDmTarget(wireIdHex: string): C4ButtonTarget | null {
+    if (!/^[0-9a-fA-F]{1,2}$/.test(wireIdHex)) return null;
     const wireId = Number.parseInt(wireIdHex, 16);
-    if (Number.isNaN(wireId)) return null;
-    const paddle = LEGACY_DM_PADDLE_IDS[wireId];
+    const paddle = Object.hasOwn(LEGACY_DM_PADDLE_IDS, wireId) ? LEGACY_DM_PADDLE_IDS[wireId] : undefined;
     return paddle ? {prefix: paddle, paddle} : null;
 }
 
@@ -354,8 +457,8 @@ function parseLegacyDmButtonEvent(text: string): C4ButtonEvent | null {
     if (ccMatch) {
         const target = resolveLegacyDmTarget(ccMatch[1]);
         if (!target) return null;
-        const count = Number.parseInt(ccMatch[2], 16);
-        if (Number.isNaN(count)) return null;
+        const count = parseClickCount(ccMatch[2]);
+        if (count === null) return null;
         const clicks = clampClickCount(count);
         return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }
@@ -386,8 +489,8 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     if (ccMatch) {
         const target = resolveButtonTarget(ccMatch[1]);
         if (!target) return null;
-        const count = Number.parseInt(ccMatch[2], 16);
-        if (Number.isNaN(count)) return null;
+        const count = parseClickCount(ccMatch[2]);
+        if (count === null) return null;
         const clicks = clampClickCount(count);
         return {action: `${target.prefix}_click_${clicks}`, ...targetIdentity(target), clickCount: clicks, type: "click"};
     }
@@ -403,16 +506,51 @@ export function parseButtonEvent(text: string): C4ButtonEvent | null {
     return null;
 }
 
+/** Longest device text a log line quotes before truncating it. */
+const C4_LOG_TEXT_MAX = 200;
+
+/**
+ * Quote device-supplied text for a log line. JSON string escaping turns CR,
+ * LF, ESC and the other control characters into visible escapes, so a frame
+ * can't forge log lines or drive a terminal; anything else outside printable
+ * ASCII (DEL, C1 controls, Unicode line separators) is escaped as well.
+ */
+export function c4LogText(text: string): string {
+    const clipped = text.length > C4_LOG_TEXT_MAX ? `${text.slice(0, C4_LOG_TEXT_MAX)}...` : text;
+    return JSON.stringify(clipped).replace(/[^\x20-\x7e]/g, (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/** Minimum time between two malformed-frame warnings for one device. */
+export const C4_FRAME_WARN_INTERVAL_MS = 60 * 1000;
+
+const c4LastFrameWarning = new Map<string, number>();
+
+/** Warn about a device's frame at most once per C4_FRAME_WARN_INTERVAL_MS per device; debug otherwise. */
+function warnC4Frame(ieeeAddr: string | undefined, message: string): void {
+    const key = ieeeAddr ?? "?";
+    const now = Date.now();
+    const last = c4LastFrameWarning.get(key);
+    if (last !== undefined && now - last < C4_FRAME_WARN_INTERVAL_MS) {
+        logger.debug(message, NS);
+        return;
+    }
+    c4LastFrameWarning.set(key, now);
+    logger.warning(message, NS);
+}
+
+/** One ls data field: one to four hex digits. */
+const C4_TELEMETRY_FIELD = /^[0-9a-fA-F]{1,4}$/;
+
 /** Parse load telemetry as a hex percent (0x00-0x64): dmx "c4.dmx.ls" (third data field) or legacy "c4.dm.t0c <level>". */
-export function parseLoadStatus(text: string): {level: number} | null {
+export function parseLoadStatus(text: string, ieeeAddr?: string): {level: number} | null {
     // dmx telemetry: the third data field is the level. Legacy "c4.dm." dimmers
     // (C4-DIM1-Z) instead report each ramp step as "c4.dm.t0c <level>".
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls \w+ \w+ (\w+)/) ?? text.match(/^0t\w+ sa c4\.dm\.t0c (\w+)/);
     if (!match) return null;
 
-    const level = Number.parseInt(match[1], 16);
+    const level = C4_TELEMETRY_FIELD.test(match[1]) ? Number.parseInt(match[1], 16) : Number.NaN;
     if (Number.isNaN(level) || level > 0x64) {
-        logger.warning(`Ignoring out-of-range load level: ${text}`, NS);
+        warnC4Frame(ieeeAddr, `${ieeeAddr ?? "?"}: ignoring out-of-range load level: ${c4LogText(text)}`);
         return null;
     }
 
@@ -422,21 +560,48 @@ export function parseLoadStatus(text: string): {level: number} | null {
 /** Number of data fields in a full ls frame; shorter frames carry no electrical readings. */
 const C4_LS_TELEMETRY_FIELDS = 10;
 
+/** Most data fields an ls frame may carry before it is treated as malformed. */
+const C4_LS_TELEMETRY_MAX_FIELDS = 16;
+
+/**
+ * Inclusive plausibility range of each electrical reading, generous for a
+ * 120-277 V in-wall load. A reading outside its range drops the whole set
+ * rather than letting a garbage value reach long-term statistics.
+ */
+export const C4_TELEMETRY_RANGES = {
+    voltage: [0, 600],
+    currentMa: [0, 20000],
+    power: [0, 5000],
+    apparentPower: [0, 5000],
+    powerFactor: [0, 1000],
+} as const;
+
 /**
  * Parse the electrical readings from a full ls frame, for example
  * "0t6850 sa c4.dmx.ls 00 00 63 0079 0070 000d 000e 03aa 0000 0000".
  * After the level: volts, milliamps, watts, volt-amps, power factor x1000, and
  * two fields of unknown meaning, published raw. The names are inferred from
  * captured frames (V x mA = VA, VA x PF = W), not from documentation.
+ * Every field must be 1-4 hex digits and every named reading within
+ * C4_TELEMETRY_RANGES, else the readings are dropped (null).
  */
 export function parseLoadTelemetry(text: string): KeyValue | null {
     const match = text.match(/^0t\w+ sa c4\.dmx\.ls\s+(.+)$/);
     if (!match) return null;
 
     const fields = match[1].trim().split(/\s+/);
-    if (fields.length < C4_LS_TELEMETRY_FIELDS || !fields.every((field) => /^[0-9a-fA-F]+$/.test(field))) return null;
+    if (fields.length < C4_LS_TELEMETRY_FIELDS || fields.length > C4_LS_TELEMETRY_MAX_FIELDS) return null;
+    if (!fields.every((field) => C4_TELEMETRY_FIELD.test(field))) return null;
 
     const [voltage, currentMa, power, apparentPower, powerFactor, unknown9, unknown10] = fields.slice(3).map((field) => Number.parseInt(field, 16));
+    const readings = {voltage, currentMa, power, apparentPower, powerFactor};
+    for (const [name, [min, max]] of Object.entries(C4_TELEMETRY_RANGES)) {
+        const value = readings[name as keyof typeof readings];
+        if (value < min || value > max) {
+            logger.debug(`Dropping implausible load telemetry (${name} ${value}): ${c4LogText(text)}`, NS);
+            return null;
+        }
+    }
     return {
         c4_load_voltage: voltage,
         c4_load_current: currentMa,
@@ -454,7 +619,7 @@ export const C4_DIMMING_PARAMS = ["01", "02", "03", "04", "05", "06", "08", "09"
 /** Parse a dimming table reply, "0r<seq> 000 c4.dm.tv 02ee" → 750, or null. */
 export function parseDimmingResponse(responseText?: string | null): number | null {
     if (!responseText) return null;
-    const match = responseText.match(/000 c4\.dm\.tv ([0-9a-fA-F]+)$/);
+    const match = responseText.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dm\.tv ([0-9a-fA-F]{1,8})\s*$/);
     return match ? Number.parseInt(match[1], 16) : null;
 }
 
@@ -526,13 +691,14 @@ export interface C4ModelType {
 
 /**
  * The type fixed by the device's reported model, or undefined while the model
- * is unknown or names no fixed type. The model is the one applyC4Identity
- * stored in meta, else the published c4_model, else a modelID it rewrote.
+ * is unknown or names no fixed type. The model is the first listed one of:
+ * the one applyC4Identity stored in meta, the published c4_model, and a
+ * modelID it rewrote. An unlisted model never shadows a listed one further
+ * down, so a stray unlisted report can't switch typing off.
  */
 export function c4ModelType(device: Zh.Device | undefined, state?: KeyValue): C4ModelType | undefined {
-    const modelID = device?.modelID;
-    const identityModelID = typeof modelID === "string" && Object.hasOwn(C4_IDENTITY_MODELS, modelID) ? modelID : undefined;
-    const model = (device?.meta.c4_model as string | undefined) ?? (state?.c4_model as string | undefined) ?? identityModelID;
+    const candidates: unknown[] = [device?.meta.c4_model, state?.c4_model, device?.modelID];
+    const model = candidates.find((candidate): candidate is string => typeof candidate === "string" && Object.hasOwn(C4_IDENTITY_MODELS, candidate));
     const type = modelDeviceType(model);
     return type && model ? {model, type} : undefined;
 }
@@ -561,7 +727,7 @@ export function classifyDeviceType(dimResponseText?: string | null): C4DeviceTyp
  */
 export function isC4DimNegativeResponse(rawText?: string | null): boolean {
     if (!rawText) return false;
-    return /\bn01\b/.test(rawText) || /^0r\w+\s+v\d{2}\b/.test(rawText);
+    return /^0r[0-9a-fA-F]{4}\s+(?:n01|v\d{2})(?:\s|$)/.test(rawText);
 }
 
 export interface C4DimProbeOutcome {
@@ -667,7 +833,23 @@ export const GENBASIC_ATTRS: readonly string[] = [
 
 // Everything below performs I/O against the device via Endpoint.sendRaw.
 
+/**
+ * True when a frame body is printable ASCII (0x20-0x7E) only. The check is on
+ * code points: Buffer.from(text, "ascii") keeps only the low byte of each one,
+ * so a character such as U+010A would otherwise go out as a bare LF and end
+ * the frame early, letting the rest smuggle in a second command.
+ */
+export function isPrintableC4Text(text: string): boolean {
+    return /^[\x20-\x7e]*$/.test(text);
+}
+
 export async function sendC4Raw(device: Zh.Device, text: string): Promise<string> {
+    // The only control characters a frame may hold are its own CRLF terminator.
+    const body = text.endsWith("\r\n") ? text.slice(0, -2) : text;
+    if (!isPrintableC4Text(body)) {
+        throw new Error(`C4 command text must be printable ASCII (0x20-0x7E), got ${c4LogText(body)}`);
+    }
+
     const ep = device.getEndpoint(1);
     if (!ep) throw new Error("Endpoint 1 not found on device");
 
@@ -690,39 +872,83 @@ export async function queryC4(device: Zh.Device, cmdBody: string): Promise<strin
 }
 
 // Queries go out on EP 1 but responses arrive from EP 197, so awaitable
-// queries register a resolver keyed by seq; the raw fromZigbee handler
-// resolves it when the matching response arrives.
-const pendingQueries = new Map<string, (responseText: string) => void>();
+// queries register a waiter; the raw fromZigbee handler resolves it when
+// the matching response arrives. The sequence number is global and sent in
+// the clear, so a waiter is bound to the queried device's IEEE address and
+// command: a reply from any other device, or one answering a different
+// command, can't resolve it (bharat/homeassistant-control4-zigbee#241).
+interface C4PendingQuery {
+    ieeeAddr: string;
+    command: string;
+    settle: (responseText: string | null) => void;
+}
 
-/** Resolve a pending query by response sequence. Returns true when a waiter existed. */
-export function resolveC4PendingQuery(seq: string, responseText: string): boolean {
-    const handler = pendingQueries.get(seq);
-    if (!handler) return false;
-    handler(responseText);
+const pendingQueries = new Map<string, C4PendingQuery>();
+
+function pendingQueryKey(ieeeAddr: string, seq: string): string {
+    return `${ieeeAddr}/${seq.toLowerCase()}`;
+}
+
+/**
+ * True when a reply could answer a query for `command`. A success reply
+ * ("0r<seq> 000 <command> <data>") must echo the queried command; an error
+ * reply ("0r<seq> n01", "0r<seq> v01") carries no echo and is accepted.
+ */
+export function isPlausibleC4Reply(responseText: string, command: string): boolean {
+    const match = /^0r[0-9a-fA-F]{4}\s+(\S+)(?:\s+(\S+))?/.exec(responseText);
+    if (!match) return false;
+    if (match[1] !== "000") return true;
+    return match[2] === undefined || match[2] === command;
+}
+
+/**
+ * Resolve the query `ieeeAddr` has pending under response sequence `seq`.
+ * Returns true when that device had such a waiter and the reply plausibly
+ * answers its command.
+ */
+export function resolveC4PendingQuery(seq: string, responseText: string, ieeeAddr: string | undefined): boolean {
+    if (!ieeeAddr) return false;
+    const pending = pendingQueries.get(pendingQueryKey(ieeeAddr, seq));
+    if (!pending || pending.ieeeAddr !== ieeeAddr) return false;
+    if (!isPlausibleC4Reply(responseText, pending.command)) {
+        logger.debug(`${ieeeAddr}: reply for seq ${seq} doesn't answer ${pending.command}, ignored`, NS);
+        return false;
+    }
+    pending.settle(responseText);
     return true;
+}
+
+/** Give up every query pending for a device (it left or was removed). */
+function abandonC4PendingQueries(ieeeAddr: string): void {
+    for (const pending of [...pendingQueries.values()]) {
+        if (pending.ieeeAddr === ieeeAddr) pending.settle(null);
+    }
 }
 
 export async function queryC4WithResponse(device: Zh.Device, cmdBody: string, timeoutMs = 3000): Promise<string | null> {
     const seq = nextSeq();
+    const key = pendingQueryKey(device.ieeeAddr, seq);
 
     return await new Promise((resolve) => {
+        let settled = false;
+        const settle = (responseText: string | null): void => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (pendingQueries.get(key)?.settle === settle) pendingQueries.delete(key);
+            resolve(responseText);
+        };
+
         const timer = setTimeout(() => {
-            pendingQueries.delete(seq);
-            logger.warning(`Timeout for seq ${seq}: ${cmdBody}`, NS);
-            resolve(null);
+            logger.warning(`Timeout for seq ${seq}: ${c4LogText(cmdBody)}`, NS);
+            settle(null);
         }, timeoutMs);
 
-        pendingQueries.set(seq, (responseText) => {
-            clearTimeout(timer);
-            pendingQueries.delete(seq);
-            resolve(responseText);
-        });
+        pendingQueries.set(key, {ieeeAddr: device.ieeeAddr, command: cmdBody.trim().split(/\s+/)[0], settle});
 
         sendC4Raw(device, formatGetCommand(seq, cmdBody)).catch((err) => {
-            clearTimeout(timer);
-            pendingQueries.delete(seq);
             logger.warning(`Send failed for seq ${seq}: ${(err as Error).message}`, NS);
-            resolve(null);
+            settle(null);
         });
     });
 }
@@ -744,7 +970,7 @@ export async function detectDeviceType(device: Zh.Device): Promise<C4Detection> 
     logger.info(`Probing device ${device.ieeeAddr}...`, NS);
 
     const dimResp = await queryC4WithResponse(device, "c4.dmx.dim", 3000);
-    logger.info(`c4.dmx.dim response: ${dimResp || "(timeout)"}`, NS);
+    logger.info(`c4.dmx.dim response: ${dimResp ? c4LogText(dimResp) : "(timeout)"}`, NS);
 
     const dimCode = parseDimResponse(dimResp);
 
@@ -819,7 +1045,7 @@ export const LED_MODE_FROM_FIRMWARE: Record<string, string> = {
  */
 export function parseParamResponse(cmd: "led" | "btn", responseText?: string | null): string | null {
     if (!responseText) return null;
-    const match = responseText.match(new RegExp(`000 c4\\.dmx\\.${cmd} ([0-9a-fA-F]{1,2})$`));
+    const match = responseText.match(new RegExp(`^0r[0-9a-fA-F]{4}\\s+000 c4\\.dmx\\.${cmd} ([0-9a-fA-F]{1,2})\\s*$`));
     if (!match) return null;
     return match[1].toLowerCase().padStart(2, "0");
 }
@@ -890,6 +1116,26 @@ const c4LoadStateTimers = new Map<string, C4LoadStateEntry>();
 const c4LastLsSeen = new Map<string, number>();
 
 /**
+ * True once herdsman has removed the device (it left the network or was
+ * removed by the user). Its save() then throws, so timers bail out instead.
+ */
+export function isC4DeviceGone(device: Zh.Device): boolean {
+    return device.isDeleted === true;
+}
+
+/** Save the device, logging rather than throwing; skipped for a removed device. Returns true when saved. */
+function saveC4Device(device: Zh.Device): boolean {
+    if (typeof device.save !== "function" || isC4DeviceGone(device)) return false;
+    try {
+        device.save();
+        return true;
+    } catch (err) {
+        logger.warning(`Saving ${device.ieeeAddr} failed: ${(err as Error).message}`, NS);
+        return false;
+    }
+}
+
+/**
  * Trailing-edge throttle of ls telemetry: each frame resets the timer, so the
  * final publish always carries the settled level and electrical readings.
  * Level 0 publishes OFF with no brightness key, preserving the last-on level.
@@ -905,10 +1151,16 @@ export function scheduleC4LoadStatePublish(device: Zh.Device | undefined, level:
 
     const entry: C4LoadStateEntry = {level, timer: null};
     entry.timer = setTimeout(() => {
-        c4LoadStateTimers.delete(key);
-        const lvl = entry.level;
-        const loadState = lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"};
-        publish(telemetry ? {...loadState, ...telemetry} : loadState);
+        // A timer callback has no caller to catch for it: never let it throw.
+        try {
+            if (c4LoadStateTimers.get(key) === entry) c4LoadStateTimers.delete(key);
+            if (isC4DeviceGone(device)) return;
+            const lvl = entry.level;
+            const loadState = lvl > 0 ? {state: "ON", brightness: Math.round((lvl * 255) / 100)} : {state: "OFF"};
+            publish(telemetry ? {...loadState, ...telemetry} : loadState);
+        } catch (err) {
+            logger.warning(`Load state publish failed for ${key}: ${(err as Error).message}`, NS);
+        }
     }, C4_LOAD_STATE_DEBOUNCE_MS);
 
     c4LoadStateTimers.set(key, entry);
@@ -931,6 +1183,7 @@ export function scheduleC4StateRead(device: Zh.Device | undefined, deviceType?: 
 
     const timer = setTimeout(async () => {
         c4StateReadTimers.delete(key);
+        if (isC4DeviceGone(device)) return;
 
         const lastLs = c4LastLsSeen.get(key);
         if (lastLs !== undefined && lastLs > scheduledAt) {
@@ -986,12 +1239,22 @@ interface C4MetaFields {
     silentProbes?: number;
 }
 
+/** Write the given fields to device.meta, saving only when one of them actually changed. */
 function persistC4Meta(device: Zh.Device, fields: C4MetaFields): void {
-    if (fields.type !== undefined) device.meta.c4_device_type = fields.type;
-    if (fields.confidence !== undefined) device.meta.c4_type_confidence = fields.confidence;
-    if (fields.dimCode !== undefined) device.meta.c4_dim_code = fields.dimCode;
-    if (fields.silentProbes !== undefined) device.meta.c4_silent_probes = fields.silentProbes;
-    if (typeof device.save === "function") device.save();
+    const updates: [string, unknown][] = [
+        ["c4_device_type", fields.type],
+        ["c4_type_confidence", fields.confidence],
+        ["c4_dim_code", fields.dimCode],
+        ["c4_silent_probes", fields.silentProbes],
+    ];
+    let dirty = false;
+    for (const [key, value] of updates) {
+        if (value !== undefined && device.meta[key] !== value) {
+            device.meta[key] = value;
+            dirty = true;
+        }
+    }
+    if (dirty) saveC4Device(device);
 }
 
 function stopC4ProbeCampaign(device: Zh.Device): void {
@@ -1000,12 +1263,70 @@ function stopC4ProbeCampaign(device: Zh.Device): void {
     c4ProbeCampaigns.delete(device.ieeeAddr);
 }
 
-/** Reset all in-memory self-heal campaign state (for testing). */
+// Diagnostic and read-back commands each send a burst of queries; a
+// repeated publish while one is still running is refused rather than
+// stacking a second burst on the same device.
+//
+// Each running operation holds a unique token, so a run that outlives a
+// "stop" can't release the guard of a newer run.
+const c4InFlight = new Map<string, symbol>();
+
+/**
+ * Run `fn` unless `operation` is already running for this device, in which
+ * case throw. `operation` may carry an argument (such as a slot id) when
+ * different arguments are independent.
+ */
+export async function withC4InFlightGuard<T>(device: Zh.Device, operation: string, fn: () => Promise<T>): Promise<T> {
+    const key = `${device.ieeeAddr}/${operation}`;
+    if (c4InFlight.has(key)) throw new Error(`${operation} is already running for ${device.ieeeAddr}`);
+    const token = Symbol(key);
+    c4InFlight.set(key, token);
+    try {
+        return await fn();
+    } finally {
+        if (c4InFlight.get(key) === token) c4InFlight.delete(key);
+    }
+}
+
+/**
+ * Drop every timer and in-memory record kept for a device. Called on the
+ * definition's "stop" event, which Zigbee2MQTT sends when the device leaves
+ * the network or is removed, so nothing keeps running against a removed device.
+ */
+export function clearC4DeviceState(ieeeAddr: string): void {
+    const campaign = c4ProbeCampaigns.get(ieeeAddr);
+    if (campaign?.timer) clearTimeout(campaign.timer);
+    c4ProbeCampaigns.delete(ieeeAddr);
+
+    const readTimer = c4StateReadTimers.get(ieeeAddr);
+    if (readTimer) clearTimeout(readTimer);
+    c4StateReadTimers.delete(ieeeAddr);
+
+    const loadEntry = c4LoadStateTimers.get(ieeeAddr);
+    if (loadEntry?.timer) clearTimeout(loadEntry.timer);
+    c4LoadStateTimers.delete(ieeeAddr);
+
+    c4LastLsSeen.delete(ieeeAddr);
+    c4LastFrameWarning.delete(ieeeAddr);
+    c4LastIdentityPersist.delete(ieeeAddr);
+    c4LastDimHealPersist.delete(ieeeAddr);
+    abandonC4PendingQueries(ieeeAddr);
+    for (const key of [...c4InFlight.keys()]) {
+        if (key.startsWith(`${ieeeAddr}/`)) c4InFlight.delete(key);
+    }
+    loggedModelConflicts.delete(ieeeAddr);
+}
+
+/** Reset all in-memory self-heal campaign and persist rate-limit state (for testing). */
 export function resetC4HealState(): void {
     for (const campaign of c4ProbeCampaigns.values()) {
         if (campaign.timer) clearTimeout(campaign.timer);
     }
     c4ProbeCampaigns.clear();
+    c4LastIdentityPersist.clear();
+    c4LastDimHealPersist.clear();
+    loggedModelConflicts.clear();
+    c4LastFrameWarning.clear();
 }
 
 /**
@@ -1030,6 +1351,15 @@ export function applyC4Heal(
 
     const already = device.meta.c4_device_type === newType && device.meta.c4_type_confidence === C4_CONFIDENCE_CONFIRMED;
     if (already) return null;
+
+    // Dim answers can flip a load type back and forth (01 dimmer, 02
+    // keypaddim), each flip a database write: take one per interval.
+    const dimHeal = evidence.dimCode != null;
+    if (dimHeal && !c4PersistDue(c4LastDimHealPersist, device.ieeeAddr)) {
+        logger.debug(`${device.ieeeAddr}: type change to ${newType} deferred (rate limited)`, NS);
+        return null;
+    }
+    if (dimHeal) c4LastDimHealPersist.set(device.ieeeAddr, Date.now());
 
     const dimCode = evidence.dimCode != null ? evidence.dimCode : ((device.meta.c4_dim_code as string | null) ?? null);
     let evidenceDesc: string;
@@ -1171,54 +1501,70 @@ export function scheduleC4ProbeCampaign(
     const campaign: C4ProbeCampaign = {silentCount: (device.meta.c4_silent_probes as number | undefined) ?? 0, timer: null};
     c4ProbeCampaigns.set(device.ieeeAddr, campaign);
 
+    // The campaign is live while it is still the one registered for this
+    // device and herdsman hasn't removed the device: a "stop" event (leave or
+    // removal) clears the registration, and a removed device's save() throws.
+    const ieeeAddr = device.ieeeAddr;
+    const isLive = (): boolean => c4ProbeCampaigns.get(ieeeAddr) === campaign && !isC4DeviceGone(device);
+    const end = (): void => {
+        if (c4ProbeCampaigns.get(ieeeAddr) === campaign) c4ProbeCampaigns.delete(ieeeAddr);
+    };
+
+    // Runs from a timer, where nothing catches a rejection (and an unhandled
+    // rejection ends the Zigbee2MQTT process), so it must never throw.
     const runProbe = async (): Promise<void> => {
         campaign.timer = null;
-
-        let outcome: C4DimProbeOutcome;
         try {
-            outcome = normalizeProbeOutcome(await probeFn(device));
+            if (!isLive()) return end();
+
+            let outcome: C4DimProbeOutcome;
+            try {
+                outcome = normalizeProbeOutcome(await probeFn(device));
+            } catch (err) {
+                logger.warning(`Probe failed for ${ieeeAddr}: ${(err as Error).message}`, NS);
+                outcome = {kind: "silent"};
+            }
+
+            // The device may have left or been removed while the probe was out.
+            if (!isLive()) return end();
+
+            // The model may have become known since the campaign started; once
+            // it is, it decides the type and the probe answer no longer matters.
+            if (c4ModelType(device)) {
+                applyC4ModelType(device, {c4_device_type: deviceType}, publish);
+                return end();
+            }
+
+            if (outcome.kind === "heal") {
+                // The dim response also flows through the raw fromZigbee handler;
+                // applyC4Heal is idempotent so both paths can observe the answer.
+                applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
+                return end();
+            }
+
+            if (outcome.kind === "negative") {
+                // An explicit no-load answer is proof, not silence: confirm now
+                // instead of burning the silent-probe budget.
+                markConfirmedC4Keypad(device, publish, {
+                    logReason: "keypad confirmed by explicit n01 answer",
+                    evidence: "explicit n01 answer",
+                });
+                return end();
+            }
+
+            campaign.silentCount += 1;
+            persistC4Meta(device, {silentProbes: campaign.silentCount});
+
+            if (campaign.silentCount >= C4_MAX_SILENT_PROBES) {
+                markConfirmedC4Keypad(device, publish);
+                return end();
+            }
+
+            campaign.timer = setTimeout(runProbe, backoffMs * 2 ** (campaign.silentCount - 1));
         } catch (err) {
-            logger.warning(`Probe failed for ${device.ieeeAddr}: ${(err as Error).message}`, NS);
-            outcome = {kind: "silent"};
+            logger.warning(`Probe campaign for ${ieeeAddr} stopped: ${(err as Error).message}`, NS);
+            end();
         }
-
-        // The model may have become known since the campaign started; once
-        // it is, it decides the type and the probe answer no longer matters.
-        if (c4ModelType(device)) {
-            applyC4ModelType(device, {c4_device_type: deviceType}, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        if (outcome.kind === "heal") {
-            // The dim response also flows through the raw fromZigbee handler;
-            // applyC4Heal is idempotent so both paths can observe the answer.
-            applyC4Heal(device, deviceType, {dimCode: outcome.dimCode}, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        if (outcome.kind === "negative") {
-            // An explicit no-load answer is proof, not silence: confirm now
-            // instead of burning the silent-probe budget.
-            markConfirmedC4Keypad(device, publish, {
-                logReason: "keypad confirmed by explicit n01 answer",
-                evidence: "explicit n01 answer",
-            });
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        campaign.silentCount += 1;
-        persistC4Meta(device, {silentProbes: campaign.silentCount});
-
-        if (campaign.silentCount >= C4_MAX_SILENT_PROBES) {
-            markConfirmedC4Keypad(device, publish);
-            c4ProbeCampaigns.delete(device.ieeeAddr);
-            return;
-        }
-
-        campaign.timer = setTimeout(runProbe, backoffMs * 2 ** (campaign.silentCount - 1));
     };
 
     campaign.timer = setTimeout(runProbe, Math.floor(random() * initialMaxMs));
