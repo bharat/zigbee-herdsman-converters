@@ -72,7 +72,7 @@ function raw(text: string, device: MockDevice, state: KeyValue = {}, publish: An
 
 function identityReport(device: MockDevice, data: KeyValue, state: KeyValue = {}, extra: KeyValue = {}): KeyValue | undefined {
     const msg = {data, endpoint: {ID: 2}, device, type: "attributeReport", cluster: "genPowerCfg", ...extra};
-    return identityFz.convert(definition, msg, vi.fn(), {}, {state, device});
+    return identityFz.convert(definition, msg, vi.fn(), {}, {state, device, deviceExposesChanged: vi.fn()});
 }
 
 describe("Control4 security hardening", () => {
