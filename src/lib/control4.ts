@@ -370,6 +370,80 @@ export function parseResponseSeq(text: string): string | null {
     return match ? match[1] : null;
 }
 
+// Ambient light: each switch reads one byte, 0x00-0xff, from a light sensor
+// on its face. It isn't lux; the value saturates at ff and isn't linear.
+// "c4.dmx.amb 00" reads it. With "c4.dmx.amb 01 02" the switch also pushes it
+// on change, at most once per "c4.dmx.amb 04" milliseconds (5000 by default).
+
+/**
+ * Parse an ambient light push, "0t<seq> sa c4.dmx.amb <live> <reported>", into
+ * the reported (second) byte: the value an "amb 00" read returns. The first
+ * byte is the live reading at send time and comes out 00 on the push sent
+ * when push mode is turned on, so it isn't used.
+ */
+export function parseAmbientPush(text?: string | null): number | null {
+    if (!text) return null;
+    const match = text.match(/^0t[0-9a-fA-F]{4}\s+sa c4\.dmx\.amb [0-9a-fA-F]{2} ([0-9a-fA-F]{2})\s*$/);
+    return match ? Number.parseInt(match[1], 16) : null;
+}
+
+/**
+ * Parse a "c4.dmx.amb 00" reply, "0r<seq> 000 c4.dmx.amb <reading>". Replies to
+ * the other amb parameters have the same shape (01 answers "00", 03 "1e",
+ * 05 "ff"), so only call this for a reply to a read we sent: see
+ * takeC4AmbientRead.
+ */
+export function parseAmbientReadReply(text?: string | null): number | null {
+    if (!text) return null;
+    const match = text.match(/^0r[0-9a-fA-F]{4}\s+000 c4\.dmx\.amb ([0-9a-fA-F]{2})\s*$/);
+    return match ? Number.parseInt(match[1], 16) : null;
+}
+
+/** True when a query body is the ambient light read, "c4.dmx.amb 00". */
+export function isC4AmbientRead(cmdBody: string): boolean {
+    return /^c4\.dmx\.amb\s+00$/.test(cmdBody.trim());
+}
+
+/** How long an ambient light read waits for its reply before it is forgotten. */
+export const C4_AMBIENT_READ_TTL_MS = 10 * 1000;
+
+/** Most ambient light reads tracked at once; the oldest is dropped beyond this. */
+const C4_AMBIENT_READ_MAX = 256;
+
+// Ambient light reads sent and not answered yet, keyed by device and sequence
+// number, with the time each one expires.
+const c4AmbientReads = new Map<string, number>();
+
+/** Remember that `seq` reads the ambient light of `ieeeAddr`. */
+export function noteC4AmbientRead(ieeeAddr: string, seq: string): void {
+    const now = Date.now();
+    for (const [key, expires] of c4AmbientReads) {
+        if (expires <= now) c4AmbientReads.delete(key);
+    }
+    while (c4AmbientReads.size >= C4_AMBIENT_READ_MAX) {
+        const oldest = c4AmbientReads.keys().next().value;
+        if (oldest === undefined) break;
+        c4AmbientReads.delete(oldest);
+    }
+    c4AmbientReads.set(pendingQueryKey(ieeeAddr, seq), now + C4_AMBIENT_READ_TTL_MS);
+}
+
+/** True, once, when `seq` is an unexpired ambient light read of `ieeeAddr`. */
+export function takeC4AmbientRead(ieeeAddr: string | undefined, seq: string): boolean {
+    if (!ieeeAddr) return false;
+    const key = pendingQueryKey(ieeeAddr, seq);
+    const expires = c4AmbientReads.get(key);
+    if (expires === undefined) return false;
+    c4AmbientReads.delete(key);
+    return expires > Date.now();
+}
+
+function forgetC4AmbientReads(ieeeAddr: string): void {
+    for (const key of [...c4AmbientReads.keys()]) {
+        if (key.startsWith(`${ieeeAddr}/`)) c4AmbientReads.delete(key);
+    }
+}
+
 // Bounded through c4FirstTime; every malformed id shares one key.
 const loggedUnknownWireIds = new Set<string | number>();
 
@@ -871,6 +945,8 @@ export async function sendC4(device: Zh.Device, cmdBody: string): Promise<string
 
 export async function queryC4(device: Zh.Device, cmdBody: string): Promise<string> {
     const seq = nextSeq();
+    // Noted before sending: the reply can arrive before the send resolves.
+    if (isC4AmbientRead(cmdBody)) noteC4AmbientRead(device.ieeeAddr, seq);
     return await sendC4Raw(device, formatGetCommand(seq, cmdBody));
 }
 
@@ -1314,6 +1390,7 @@ export function clearC4DeviceState(ieeeAddr: string): void {
     c4LastIdentityPersist.delete(ieeeAddr);
     c4LastDimHealPersist.delete(ieeeAddr);
     abandonC4PendingQueries(ieeeAddr);
+    forgetC4AmbientReads(ieeeAddr);
     for (const key of [...c4InFlight.keys()]) {
         if (key.startsWith(`${ieeeAddr}/`)) c4InFlight.delete(key);
     }
@@ -1330,6 +1407,7 @@ export function resetC4HealState(): void {
     c4LastDimHealPersist.clear();
     loggedModelConflicts.clear();
     c4LastFrameWarning.clear();
+    c4AmbientReads.clear();
 }
 
 /**
