@@ -1689,6 +1689,15 @@ describe("Control4 glue", () => {
             );
         });
 
+        it("ambient light publishes the frozen ambient_light key", async () => {
+            // The integration's ambient light sensor reads this name.
+            const [rawFz] = definition.fromZigbee as unknown as [{convert: (...args: unknown[]) => Promise<KeyValue | undefined>}];
+            const {device} = makeDevice("0x0F01", {c4_device_type: "dimmer", c4_type_confidence: C4_CONFIDENCE_CONFIRMED});
+            const msg = {data: Buffer.from("0t0001 sa c4.dmx.amb 00 b1", "ascii"), endpoint: {ID: 197}, device, type: "raw", cluster: "genPowerCfg"};
+            const result = await rawFz.convert(definition, msg, vi.fn(), {}, {state: {}, device});
+            expect(result).toMatchObject({ambient_light: 0xb1});
+        });
+
         it("dimming table reads publish exactly the frozen c4_tv_* keys", () => {
             // The integration's number entities subscribe to these names.
             expect(C4_DIMMING_PARAMS.map((param) => `c4_tv_${param}`)).toEqual([

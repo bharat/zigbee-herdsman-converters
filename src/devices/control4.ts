@@ -135,6 +135,12 @@ const makeFzControl4Response = (opts: {heal: boolean; legacyDialect: boolean}) =
                 return result;
             }
 
+            // Ambient light: a push, or the reply to a "c4.dmx.amb 00" read
+            // sent through c4_query. The raw frame stays in c4_response.
+            const ambientLight =
+                c4.parseAmbientPush(text) ?? (respSeq && c4.takeC4AmbientRead(msg.device?.ieeeAddr, respSeq) ? c4.parseAmbientReadReply(text) : null);
+            if (ambientLight !== null) result.ambient_light = ambientLight;
+
             return result;
         },
     }) satisfies Fz.Converter<"genPowerCfg", undefined, ["raw"]>;
